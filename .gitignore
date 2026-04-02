@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Project outputs and caches
+data/
+models/
+logs/
+plots/
+runs/
+
+# Local temp files
+*.log
+*.tmp
+*.swp
+
+# Notebook checkpoints
+.ipynb_checkpoints/
