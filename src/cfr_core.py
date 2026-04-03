@@ -47,26 +47,7 @@ class CFRBehaviorSelector:
                 mask[action] = True
         return mask
 
-    def _build_fallback_strategy(self, mask, fallback_strategy=None):
-        fallback = np.zeros(self.num_actions, dtype=np.float64)
-        if fallback_strategy is not None:
-            fallback_arr = np.asarray(fallback_strategy, dtype=np.float64)
-            if fallback_arr.shape != (self.num_actions,):
-                raise ValueError(
-                    f"fallback_strategy shape mismatch: expected {(self.num_actions,)}, got {fallback_arr.shape}"
-                )
-            fallback = np.maximum(fallback_arr, 0.0) * mask
-            total = fallback.sum()
-            if total > 0:
-                return fallback / total
-
-        if mask.any():
-            fallback[mask] = 1.0 / mask.sum()
-        else:
-            fallback[self.default_action] = 1.0
-        return fallback
-
-    def get_current_strategy(self, state_key=None, allowed_actions=None, fallback_strategy=None):
+    def get_current_strategy(self, state_key=None, allowed_actions=None):
         key = self._ensure_state(state_key)
         mask = self._build_mask(allowed_actions)
 
@@ -75,49 +56,32 @@ class CFRBehaviorSelector:
         if total > 0:
             return pos_regret / total
 
-        return self._build_fallback_strategy(mask, fallback_strategy=fallback_strategy)
+        fallback = np.zeros(self.num_actions, dtype=np.float64)
+        if mask.any():
+            fallback[mask] = 1.0 / mask.sum()
+        else:
+            fallback[self.default_action] = 1.0
+        return fallback
 
-    def get_average_strategy(self, state_key=None, allowed_actions=None, fallback_strategy=None):
+    def get_average_strategy(self, state_key=None, allowed_actions=None):
         key = self._ensure_state(state_key)
         mask = self._build_mask(allowed_actions)
         strategy_sum = self.strategy_sum_by_state[key] * mask
         total = strategy_sum.sum()
         if total > 0:
             return strategy_sum / total
-        return self.get_current_strategy(
-            state_key,
-            allowed_actions,
-            fallback_strategy=fallback_strategy,
-        )
+        return self.get_current_strategy(state_key, allowed_actions)
 
-    def get_action(
-        self,
-        state_key=None,
-        explore=True,
-        allowed_actions=None,
-        force_action=None,
-        fallback_strategy=None,
-    ):
+    def get_action(self, state_key=None, explore=True, allowed_actions=None, force_action=None):
         if force_action is not None:
             return force_action
 
-        strategy = self.get_current_strategy(
-            state_key,
-            allowed_actions,
-            fallback_strategy=fallback_strategy,
-        )
+        strategy = self.get_current_strategy(state_key, allowed_actions)
         if explore:
             return int(np.random.choice(self.num_actions, p=strategy))
         return int(np.argmax(strategy))
 
-    def update_regret(
-        self,
-        state_key,
-        chosen_action,
-        action_values,
-        allowed_actions=None,
-        fallback_strategy=None,
-    ):
+    def update_regret(self, state_key, chosen_action, action_values, allowed_actions=None):
         key = self._ensure_state(state_key)
         mask = self._build_mask(allowed_actions)
         if not mask.any():
@@ -128,11 +92,7 @@ class CFRBehaviorSelector:
         regrets = np.zeros(self.num_actions, dtype=np.float64)
         regrets[mask] = action_values[mask] - chosen_value
         self.regret_sum_by_state[key] += regrets
-        self.strategy_sum_by_state[key] += self.get_current_strategy(
-            state_key,
-            allowed_actions,
-            fallback_strategy=fallback_strategy,
-        )
+        self.strategy_sum_by_state[key] += self.get_current_strategy(state_key, allowed_actions)
         self.iter_by_state[key] += 1
 
     def get_total_regret(self):
