@@ -441,6 +441,20 @@ def build_middle_state(selected_agent, phase):
         f"phase={phase}",
     )
 
+def build_middle_fallback_strategy():
+    """
+    中层在“所有正遗憾都为 0”时的默认先验：
+
+    - `silent` 初始视为无意义，不给先验概率
+    - `comment / answer` 各 0.5
+
+    这个先验既用于首轮初始采样，也用于后续“正遗憾全非正”时的回退分布。
+    """
+    fallback = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
+    fallback[MIDDLE_ACTION_COMMENT] = 0.5
+    fallback[MIDDLE_ACTION_ANSWER] = 0.5
+    return fallback
+
 def get_middle_allowed_actions(rnd, incumbent_pred, allow_silent=True):
     """
     中层动作空间：
@@ -449,13 +463,17 @@ def get_middle_allowed_actions(rnd, incumbent_pred, allow_silent=True):
     - answer
 
     只保留“物理上必须有”的约束：
+    - 第 1 轮不让 `silent` 出现，初始只在 `comment / answer` 之间二选一
     - 最后一轮如果还没有 incumbent，必须 answer，避免整条样本没有答案
 
     其余情况下，不再用手工规则把策略锁死给某个动作，
     而是让 middle CFR 在 phase 条件下自己学。
     """
-    if incumbent_pred is None and rnd <= NO_INCUMBENT_FORCE_ANSWER_ROUNDS:
-        return [MIDDLE_ACTION_ANSWER]
+    if rnd == 1:
+        return [
+            MIDDLE_ACTION_COMMENT,
+            MIDDLE_ACTION_ANSWER,
+        ]
     if rnd == NUM_ROUNDS and incumbent_pred is None:
         return [MIDDLE_ACTION_ANSWER]
     if allow_silent:
@@ -654,9 +672,18 @@ def get_constrained_middle_strategy(
             incumbent_pred,
             allow_silent=allow_silent,
         )
+    fallback_strategy = build_middle_fallback_strategy()
     # 兼容旧函数名保留接口；当前中层直接使用最朴素的 regret-matching
     # 原始策略，不再额外施加 search 状态下的 floor / cap 约束。
-    strategy = selector.get_current_strategy(state, allowed_actions)
+    # 当所有正遗憾都为 0 时，回退到：
+    # - silent=0
+    # - comment=0.5
+    # - answer=0.5
+    strategy = selector.get_current_strategy(
+        state,
+        allowed_actions,
+        fallback_strategy=fallback_strategy,
+    )
     return state, allowed_actions, strategy
 
 def choose_middle_action(
@@ -2044,6 +2071,7 @@ def update_three_layer_regrets(
             act,
             middle_action_values,
             allowed_actions=selected_allowed_actions,
+            fallback_strategy=build_middle_fallback_strategy(),
         )
 
     if outer_cfr is not None:

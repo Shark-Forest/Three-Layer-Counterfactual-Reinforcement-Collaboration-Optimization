@@ -89,7 +89,12 @@
 - 算法：`CFR / regret matching`
 - 当前直接使用 raw regret-matching：
   - 正遗憾归一化为当前策略
-  - 若所有正遗憾都为 0，则在允许动作上均匀分布
+  - 第 `1` 轮不允许 `silent`，固定为 `comment=0.5, answer=0.5`
+  - 从第 `2` 轮开始按遗憾匹配更新
+  - 若某个状态下所有正遗憾都为 `0`，则回退到：
+    - `silent = 0`
+    - `comment = 0.5`
+    - `answer = 0.5`
   - 不再额外施加 `search` 状态下的中层动作概率约束
 - 在不启用外层调度器的实验里：
   - 仍然保留多个 agent bundle

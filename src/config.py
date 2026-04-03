@@ -137,6 +137,11 @@ SEARCH_NO_INCUMBENT_MIN_ANSWER_PROB = 0.60
 SEARCH_NO_INCUMBENT_MAX_SILENT_PROB = 0.00
 SEARCH_LATE_ROUND_ANSWER_BONUS = 0.10
 SEARCH_SILENT_PENALTY = 0.03
+# 旧版本曾用它在“无 incumbent 的前几轮”强制 answer；
+# 当前版本已改成：
+# - 第 1 轮只允许 comment / answer，各 0.5
+# - 最后一轮若仍无 incumbent，再强制 answer
+# 这里保留这个配置名仅为兼容旧实验记录。
 NO_INCUMBENT_FORCE_ANSWER_ROUNDS = 2
 ANSWER_CANDIDATE_CHANGE_BONUS = 0.01
 ANSWER_CANDIDATE_CHANGE_PENALTY = 0.03
