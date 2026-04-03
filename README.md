@@ -213,7 +213,10 @@ GSM8K 现在统一采用：
 
 `with comment 的下一次 answer 的 reward - without comment 的下一次 answer 的 reward`
 
-对应实现见 [run_all.py](run_all.py#L1212) 和 [run_all.py](run_all.py#L2504)。
+这里的 `with/without` 都只继续 rollout 1 个虚拟 answer，
+不会在每个 comment candidate 下再展开一整组 answer candidates。
+
+对应实现见 [run_all.py](run_all.py#L1198) 和 [run_all.py](run_all.py#L2463)。
 
 ### 6.3 中间层策略+GSPO / 中间层策略+GSPO（无沉默） / 全量策略 / 全量策略（中层无沉默）中的 value 定义
 
@@ -229,7 +232,7 @@ GSM8K 现在统一采用：
 
 `B(s) = E[next_answer_reward | 当前状态 s 下本轮选择 silent]`
 
-实现见 [run_all.py](run_all.py#L1298)。
+实现见 [run_all.py](run_all.py#L1277)。
 
 #### comment 的 value
 
@@ -240,7 +243,12 @@ GSM8K 现在统一采用：
 也就是说，这里仍然是“comment 是否提升后续 answer”；
 只是现在 answer 和 comment 都统一减去同一个 silent 基线，进入同一坐标系里比较。
 
-实现见 [run_all.py](run_all.py#L1467)。
+这里的虚拟 rollout 也都只取 1 次：
+
+- 一个 comment candidate 只继续生成 1 个 next answer
+- `silent` 基线也只继续生成 1 个 next answer
+
+实现见 [run_all.py](run_all.py#L1436)。
 
 #### silent 的 value
 
@@ -264,18 +272,21 @@ GSM8K 现在统一采用：
   - 使用这轮真实采样里真正被选中的那个 candidate 的 value
 - 未选动作：
   - 额外做 counterfactual Monte Carlo 采样
-  - `answer` 会额外采样若干个 counterfactual answer batch
-  - 每个 batch 先对组内 candidates 的 value 取均值
-  - 再对这些 batch 均值取平均
-  - `comment` 同理，也是先对每个 comment batch 的 candidates 取均值，再对多个 batch 均值取平均
-  - 因此 comment 的反事实估计本质上是“均值的均值”
-  - 其中 comment 单个 candidate 的 value 本身又是“该 comment 下 next answer reward 的 Monte Carlo 均值减去 silent 基线”
+  - `answer`：采样 1 个 counterfactual answer batch，并对组内 candidates 的 value 取均值
+  - `comment`：采样 1 个 counterfactual comment batch，并对组内 candidates 的 value 取均值
+  - 其中 comment 单个 candidate 的 value 本身是“该 comment 下 rollout 1 个 next answer 的 reward 减去当前 silent 基线”
 - `silent` 固定使用 `0`
 - regret 由 `action_value(other) - action_value(chosen)` 形成
 
+因此当前实现里：
+
+- 真实轨迹：comment / answer 仍然各自产生一组 candidates
+- 虚拟 rollout：每条 comment 轨迹只继续产生 1 个 answer
+- 反事实动作价值：只采样 1 个 counterfactual batch，不再做 batch 均值外再套一层 batch 均值
+
 当前中层的动作采样也直接使用 raw regret-matching 策略，不再对 `search` 状态施加额外的动作概率约束。
 
-对应更新逻辑见 [run_all.py](run_all.py#L1982)。
+对应更新逻辑见 [run_all.py](run_all.py#L1941)。
 
 ### 6.5 外层调度器的价值
 
@@ -297,7 +308,7 @@ GSM8K 现在统一采用：
 
 而不再直接比较“本轮结束后 incumbent answer 的 reward”。
 
-实现见 [run_all.py](run_all.py#L1513) 和 [run_all.py](run_all.py#L1982)。
+实现见 [run_all.py](run_all.py#L1476) 和 [run_all.py](run_all.py#L1941)。
 
 ## 7. 代码结构
 

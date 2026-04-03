@@ -851,7 +851,7 @@ def sample_gspo_step(agent, question, history, rnd, speaker, kind, prompt_overri
         "selected_text": selected_text,
     }
 
-def rollout_from_step(question, gt, step, future_steps, current_text, num_samples):
+def rollout_from_step(question, gt, step, future_steps, current_text, num_samples=None):
     """
     从某个 step 开始，向后模拟未来轨迹，并估计它会带来多少奖励。
 
@@ -862,40 +862,36 @@ def rollout_from_step(question, gt, step, future_steps, current_text, num_sample
     - “然后后面继续往下模拟”
     - “最后能得到多好的答案？”
     """
-    rewards = []
-    for _ in range(num_samples):
-        history = append_round_output(
-            step["pre_history"],
-            step["round"],
-            step["speaker"],
-            current_text,
-            step["kind"],
+    history = append_round_output(
+        step["pre_history"],
+        step["round"],
+        step["speaker"],
+        current_text,
+        step["kind"],
+    )
+    if step["kind"] == "answer":
+        pred = extract_pred_num(current_text)
+        return reward_from_pred(pred, gt)
+
+    final_pred = None
+    for future_step in future_steps:
+        future_ctx = build_context(question, history)
+        future_text = future_step["agent"].sample_text(
+            future_ctx,
+            prompt_override=future_step["prompt_override"],
         )
-        if step["kind"] == "answer":
-            pred = extract_pred_num(current_text)
-            rewards.append(reward_from_pred(pred, gt))
-            continue
+        history = append_round_output(
+            history,
+            future_step["round"],
+            future_step["speaker"],
+            future_text,
+            future_step["kind"],
+        )
+        if future_step["kind"] == "answer":
+            final_pred = extract_pred_num(future_text)
+            break
 
-        final_pred = None
-        for future_step in future_steps:
-            future_ctx = build_context(question, history)
-            future_text = future_step["agent"].sample_text(
-                future_ctx,
-                prompt_override=future_step["prompt_override"],
-            )
-            history = append_round_output(
-                history,
-                future_step["round"],
-                future_step["speaker"],
-                future_text,
-                future_step["kind"],
-            )
-            if future_step["kind"] == "answer":
-                final_pred = extract_pred_num(future_text)
-                break
-
-        rewards.append(reward_from_pred(final_pred, gt))
-    return sum(rewards) / len(rewards) if rewards else 0.0
+    return reward_from_pred(final_pred, gt)
 
 def compute_deferred_rewards_for_step(segment_steps, step_idx, gt):
     """
@@ -924,7 +920,6 @@ def compute_deferred_rewards_for_step(segment_steps, step_idx, gt):
         step,
         future_steps,
         "",
-        GSPO_COMMENT_EVAL_SAMPLES,
     )
     return [
         rollout_from_step(
@@ -933,7 +928,6 @@ def compute_deferred_rewards_for_step(segment_steps, step_idx, gt):
             step,
             future_steps,
             cand["text"],
-            GSPO_COMMENT_EVAL_SAMPLES,
         ) - without_reward
         for cand in step["batch"]["candidates"]
     ]
@@ -1128,27 +1122,24 @@ def average_next_answer_reward(
     rnd,
     incumbent_pred,
     gt,
-    num_samples,
+    num_samples=None,
 ):
     """
     估计“从当前历史继续 rollout，到最近一次 answer 出现时”的绝对 reward。
 
-    这个量不再掺入 incumbent baseline，
-    主要给 comment 的 with/without 比较使用：
+    当前明确只采样 1 条虚拟轨迹：
+    - 不会在一个 comment 候选下再展开一整组 answer
+    - 从而避免 comment->answer 的组合在 rollout 中指数膨胀
 
-        reward(with comment next_answer) - reward(without comment next_answer)
+    这个量不再掺入 incumbent baseline，
+    主要给 comment 的 with/without 比较与 silent 基线使用。
     """
-    rewards = []
-    for _ in range(num_samples):
-        answer_text = agent_bundle["pi1"].sample_text(
-            build_context(question, history),
-            prompt_override=PI1_PROMPT,
-        )
-        answer_pred = extract_pred_num(answer_text)
-        rewards.append(
-            rollout_terminal_absolute_reward(answer_pred, incumbent_pred, gt)
-        )
-    return sum(rewards) / len(rewards) if rewards else 0.0
+    answer_text = agent_bundle["pi1"].sample_text(
+        build_context(question, history),
+        prompt_override=PI1_PROMPT,
+    )
+    answer_pred = extract_pred_num(answer_text)
+    return rollout_terminal_absolute_reward(answer_pred, incumbent_pred, gt)
 
 def average_answer_delta_reward(
     agent_bundle,
@@ -1157,7 +1148,7 @@ def average_answer_delta_reward(
     rnd,
     incumbent_pred,
     gt,
-    num_samples,
+    num_samples=None,
 ):
     """
     估计“如果现在尝试 answer，平均能带来多少相对 incumbent 的提升”：
@@ -1167,17 +1158,12 @@ def average_answer_delta_reward(
     这个量用于：
     - 中层 CFR 中 action=answer 的反事实估值
     """
-    rewards = []
-    for _ in range(num_samples):
-        answer_text = agent_bundle["pi1"].sample_text(
-            build_context(question, history),
-            prompt_override=PI1_PROMPT,
-        )
-        answer_pred = extract_pred_num(answer_text)
-        rewards.append(
-            rollout_terminal_delta_reward(answer_pred, incumbent_pred, gt)
-        )
-    return sum(rewards) / len(rewards) if rewards else 0.0
+    answer_text = agent_bundle["pi1"].sample_text(
+        build_context(question, history),
+        prompt_override=PI1_PROMPT,
+    )
+    answer_pred = extract_pred_num(answer_text)
+    return rollout_terminal_delta_reward(answer_pred, incumbent_pred, gt)
 
 def average_next_answer_delta_reward(
     agent_bundle,
@@ -1215,9 +1201,9 @@ def compute_comment_candidate_rewards(step, agent_bundle, verifier, incumbent_te
 
     算法是典型的 with-comment / without-comment 对比：
     - without_comment:
-      不加这条 comment，直接看下一步 answer 的平均绝对 reward
+      不加这条 comment，直接 rollout 1 个下一步 answer 的绝对 reward
     - with_comment:
-      把这条 comment 拼进历史，再看下一步 answer 的平均绝对 reward
+      把这条 comment 拼进历史，再 rollout 1 个下一步 answer 的绝对 reward
     - 两者差值：
       就是这条 comment 对后续 answer 的边际帮助
     """
@@ -1228,7 +1214,6 @@ def compute_comment_candidate_rewards(step, agent_bundle, verifier, incumbent_te
         min(step["round"] + 1, NUM_ROUNDS),
         incumbent_pred,
         gt,
-        GSPO_COMMENT_EVAL_SAMPLES,
     )
 
     rewards = []
@@ -1247,12 +1232,11 @@ def compute_comment_candidate_rewards(step, agent_bundle, verifier, incumbent_te
             min(step["round"] + 1, NUM_ROUNDS),
             incumbent_pred,
             gt,
-            GSPO_COMMENT_EVAL_SAMPLES,
         )
         rewards.append(with_comment - without_comment)
     return rewards
 
-def average_policy_stack_answer_reward(agent_bundle, question, history, gt, num_samples):
+def average_policy_stack_answer_reward(agent_bundle, question, history, gt, num_samples=None):
     """
     给共享策略栈估计“下一次 answer 自身的质量 r”。
 
@@ -1260,16 +1244,12 @@ def average_policy_stack_answer_reward(agent_bundle, question, history, gt, num_
     - answer 的价值就是 answer utterance 自身的质量
     - 如果这次 answer 不可解析，就直接按 r(None) 记分
     """
-    rewards = []
-    num_samples = max(int(num_samples), 1)
-    for _ in range(num_samples):
-        answer_text = agent_bundle["pi1"].sample_text(
-            build_context(question, history),
-            prompt_override=PI1_PROMPT,
-        )
-        answer_pred = extract_pred_num(answer_text)
-        rewards.append(reward_from_pred(answer_pred, gt))
-    return sum(rewards) / len(rewards) if rewards else 0.0
+    answer_text = agent_bundle["pi1"].sample_text(
+        build_context(question, history),
+        prompt_override=PI1_PROMPT,
+    )
+    answer_pred = extract_pred_num(answer_text)
+    return reward_from_pred(answer_pred, gt)
 
 def estimate_middle_silent_baseline(
     agent_bundle,
@@ -1278,7 +1258,7 @@ def estimate_middle_silent_baseline(
     rnd,
     incumbent_pred,
     gt,
-    num_samples,
+    num_samples=None,
 ):
     """
     中层动作 value 的共享静默基线：
@@ -1292,7 +1272,6 @@ def estimate_middle_silent_baseline(
         min(rnd + 1, NUM_ROUNDS),
         incumbent_pred,
         gt,
-        num_samples,
     )
 
 def compute_centered_answer_candidate_values(batch, gt, silent_baseline):
@@ -1327,7 +1306,7 @@ def estimate_policy_stack_comment_value(
     rnd,
     incumbent_pred,
     gt,
-    num_samples,
+    num_samples=None,
     comment_text=None,
     speaker="pi0_cf",
     silent_baseline=None,
@@ -1346,7 +1325,6 @@ def estimate_policy_stack_comment_value(
             rnd,
             incumbent_pred,
             gt,
-            num_samples,
         )
     if comment_text is None:
         comment_text = agent_bundle["pi0"].sample_text(
@@ -1367,7 +1345,6 @@ def estimate_policy_stack_comment_value(
         min(rnd + 1, NUM_ROUNDS),
         incumbent_pred,
         gt,
-        num_samples,
     )
     return with_comment_reward - silent_baseline
 
@@ -1386,7 +1363,6 @@ def compute_policy_stack_comment_candidate_rewards(
             step["round"],
             incumbent_pred,
             gt,
-            GSPO_COMMENT_EVAL_SAMPLES,
         )
     rewards = []
     for cand in step["batch"]["candidates"]:
@@ -1398,7 +1374,6 @@ def compute_policy_stack_comment_candidate_rewards(
                 step["round"],
                 incumbent_pred,
                 gt,
-                GSPO_COMMENT_EVAL_SAMPLES,
                 comment_text=cand["text"],
                 speaker=step["speaker"],
                 silent_baseline=silent_baseline,
@@ -1439,7 +1414,6 @@ def estimate_policy_stack_answer_value(
     incumbent_pred,
     gt,
     silent_baseline=None,
-    num_batches=1,
 ):
     if silent_baseline is None:
         silent_baseline = estimate_middle_silent_baseline(
@@ -1449,20 +1423,15 @@ def estimate_policy_stack_answer_value(
             rnd,
             incumbent_pred,
             gt,
-            GSPO_COMMENT_EVAL_SAMPLES,
         )
-    batch_means = []
-    num_batches = max(int(num_batches), 1)
-    for _ in range(num_batches):
-        batch = sample_counterfactual_policy_batch(
-            agent_bundle["pi1"],
-            question,
-            history,
-            prompt_override=PI1_PROMPT,
-        )
-        values = compute_centered_answer_candidate_values(batch, gt, silent_baseline)
-        batch_means.append(sum(values) / len(values) if values else 0.0)
-    return sum(batch_means) / len(batch_means) if batch_means else 0.0
+    batch = sample_counterfactual_policy_batch(
+        agent_bundle["pi1"],
+        question,
+        history,
+        prompt_override=PI1_PROMPT,
+    )
+    values = compute_centered_answer_candidate_values(batch, gt, silent_baseline)
+    return sum(values) / len(values) if values else 0.0
 
 def estimate_policy_stack_comment_value_mean(
     agent_bundle,
@@ -1472,7 +1441,6 @@ def estimate_policy_stack_comment_value_mean(
     incumbent_pred,
     gt,
     silent_baseline=None,
-    num_batches=1,
 ):
     if silent_baseline is None:
         silent_baseline = estimate_middle_silent_baseline(
@@ -1482,33 +1450,28 @@ def estimate_policy_stack_comment_value_mean(
             rnd,
             incumbent_pred,
             gt,
-            GSPO_COMMENT_EVAL_SAMPLES,
         )
-    batch_means = []
-    num_batches = max(int(num_batches), 1)
-    for _ in range(num_batches):
-        batch = sample_counterfactual_policy_batch(
-            agent_bundle["pi0"],
-            question,
-            history,
-            prompt_override=PI0_PROMPT,
-        )
-        step = {
-            "question": question,
-            "pre_history": history,
-            "round": rnd,
-            "speaker": "pi0_cf_batch",
-            "batch": batch,
-        }
-        rewards = compute_policy_stack_comment_candidate_rewards(
-            step,
-            agent_bundle,
-            incumbent_pred,
-            gt,
-            silent_baseline=silent_baseline,
-        )
-        batch_means.append(sum(rewards) / len(rewards) if rewards else 0.0)
-    return sum(batch_means) / len(batch_means) if batch_means else 0.0
+    batch = sample_counterfactual_policy_batch(
+        agent_bundle["pi0"],
+        question,
+        history,
+        prompt_override=PI0_PROMPT,
+    )
+    step = {
+        "question": question,
+        "pre_history": history,
+        "round": rnd,
+        "speaker": "pi0_cf_batch",
+        "batch": batch,
+    }
+    rewards = compute_policy_stack_comment_candidate_rewards(
+        step,
+        agent_bundle,
+        incumbent_pred,
+        gt,
+        silent_baseline=silent_baseline,
+    )
+    return sum(rewards) / len(rewards) if rewards else 0.0
 
 def compute_outer_agent_value(middle_action_values, middle_strategy):
     """
@@ -1550,8 +1513,9 @@ def estimate_middle_action_values(
       那么这里直接复用，不再为这个动作再跑一遍反事实 rollout。
     - 这样中层 regret 更新和外层调度更新就能共享同一轮里的价值估计，
       避免 selected agent 的 chosen action 被重复计算。
-    - 对未选中的 comment / answer，会额外采样多个 counterfactual batch
-      再取均值，降低单批采样噪声。
+    - 对未选中的 comment / answer，只额外采样 1 个 counterfactual batch。
+    - 其中 comment batch 内每个 candidate 也只继续 rollout 1 个 next answer，
+      不再出现“comment 下又展开一组 answer”的均值嵌套。
     """
     allowed_actions = get_middle_allowed_actions(
         rnd,
@@ -1567,7 +1531,6 @@ def estimate_middle_action_values(
         rnd,
         incumbent_pred,
         gt,
-        GSPO_COMMENT_EVAL_SAMPLES,
     )
 
     if MIDDLE_ACTION_COMMENT in allowed_actions:
@@ -1582,7 +1545,6 @@ def estimate_middle_action_values(
                 incumbent_pred,
                 gt,
                 silent_baseline=silent_baseline,
-                num_batches=MIDDLE_CF_NUM_BATCHES,
             )
     if MIDDLE_ACTION_ANSWER in allowed_actions:
         if known_action == MIDDLE_ACTION_ANSWER and known_value is not None:
@@ -1596,7 +1558,6 @@ def estimate_middle_action_values(
                 incumbent_pred,
                 gt,
                 silent_baseline=silent_baseline,
-                num_batches=MIDDLE_CF_NUM_BATCHES,
             )
     if MIDDLE_ACTION_SILENT in allowed_actions:
         if known_action == MIDDLE_ACTION_SILENT and known_value is not None:
@@ -1805,7 +1766,6 @@ def run_three_layer_realized_action(
             rnd,
             pre_incumbent_pred,
             gt,
-            GSPO_COMMENT_EVAL_SAMPLES,
         )
         step = sample_gspo_step(
             agents[selected_agent]["pi0"],
@@ -1847,7 +1807,6 @@ def run_three_layer_realized_action(
             rnd,
             pre_incumbent_pred,
             gt,
-            GSPO_COMMENT_EVAL_SAMPLES,
         )
         step = sample_gspo_step(
             agents[selected_agent]["pi1"],

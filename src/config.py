@@ -46,12 +46,12 @@ GSPO_TRAIN_LAST_N_LAYERS = 2       # 除lm_head外，再解冻最后N层decoder 
 # - "float16":  保留 fp16，不推荐
 # - "auto":     CUDA 支持 bf16 时用 bf16，否则退回 fp32
 GSPO_TRAIN_DTYPE = "bfloat16"
-# 评论/协作轮奖励使用更多次下一轮解答取平均，进一步降低高方差。
-GSPO_COMMENT_EVAL_SAMPLES = 4
-# 中层对“未被真实选中的动作”做反事实估计时，
-# 额外重复采样多少个 candidate batch 再取均值。
-# 已选动作仍然只使用真实轨迹里那一个 value，不做这里的多批平均。
-MIDDLE_CF_NUM_BATCHES = 2
+# 虚拟 rollout 明确只采样 1 个 next answer：
+# - 真实轨迹里的 comment / answer 仍然是一整组候选
+# - 但在 comment 奖励评估、silent 基线、反事实轨迹里，
+#   每条虚拟轨迹只继续生成 1 个 answer，避免 comment 下再展开一组 answer
+#   导致计算量近似 g^g 爆炸
+GSPO_COMMENT_EVAL_SAMPLES = 1
 # 如果一组候选奖励几乎完全一样，说明这次更新没有足够区分信号，直接跳过更稳。
 GSPO_SKIP_ZERO_SIGNAL_UPDATE = True
 GSPO_MIN_REWARD_STD = 0.05

@@ -163,7 +163,8 @@
 
 - `with comment` 的下一次 answer 的 `r`
 - 减去当前状态下 `silent` 的基线 reward
-- 对单个 comment candidate 而言，内部仍通过 Monte Carlo 估计它触发的下一次 answer 质量
+- 对单个 comment candidate 而言，只继续 rollout `1` 个 next answer
+- `silent` 基线也只继续 rollout `1` 个 next answer
 
 ### 7.3 answer value
 
@@ -185,9 +186,9 @@
   - 直接使用真实轨迹里被选中的那个 candidate 的单个 value
 - 未选动作：
   - 额外做 counterfactual Monte Carlo 采样
-  - `answer`：先对一个 answer batch 内所有 candidates 的 value 取均值，再对多个 batch 均值取平均
-  - `comment`：同理，先做单 batch 候选均值，再做多 batch 均值平均
-  - 因此 comment 的反事实本质上是“均值的均值”
+  - `answer`：采样 `1` 个 counterfactual answer batch，并对组内 candidates 的 value 取均值
+  - `comment`：采样 `1` 个 counterfactual comment batch，并对组内 candidates 的 value 取均值
+  - comment batch 里的每个 candidate 也只继续 rollout `1` 个 next answer
 - `silent`：
   - 固定为 `0`
 - regret 更新：
@@ -211,8 +212,7 @@
 - `GSPO_NUM_CANDIDATES = 4`
 - `GSPO_CLIP_EPS = 0.1`
 - `GSPO_TRAIN_DTYPE = "bfloat16"`
-- `GSPO_COMMENT_EVAL_SAMPLES = 4`
-- `MIDDLE_CF_NUM_BATCHES = 2`
+- `GSPO_COMMENT_EVAL_SAMPLES = 1`
 - `GSPO_MAX_GRAD_NORM = 0.5`
 - `GSPO_USE_INDEPENDENT_MODEL = True`
 - `GSPO_TRAIN_LAST_N_LAYERS = 2`
