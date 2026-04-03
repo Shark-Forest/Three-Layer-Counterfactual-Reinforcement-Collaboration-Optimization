@@ -469,16 +469,6 @@ def get_middle_allowed_actions(rnd, incumbent_pred, allow_silent=True):
         MIDDLE_ACTION_ANSWER,
     ]
 
-def _candidate_consensus_counts(candidates):
-    counts = {}
-    for cand in candidates:
-        pred = extract_pred_num(cand["text"])
-        if pred is None:
-            continue
-        key = round(float(pred), 6)
-        counts[key] = counts.get(key, 0) + 1
-    return counts
-
 def set_sampled_batch_selected_candidate(agent, batch, selected_idx):
     selected_idx = max(0, min(int(selected_idx), len(batch["candidates"]) - 1))
     batch["selected_idx"] = selected_idx
@@ -497,19 +487,30 @@ def select_answer_candidate_index(
     batch,
 ):
     """
-    在同一批候选里做推理时可用的候选选择。
+    在同一批候选里选择“进入真实轨迹”的 answer。
 
-    不使用 reward / 真值，只使用：
-    - 是否能抽取出数字答案
-    - verifier 对“是否值得接管 incumbent”的概率估计
-    - 是否保持 incumbent 不变
-    - 同批候选里的数值一致性（出现次数）
+    当前统一规则只保留一个主准则：
+    - 选择 verifier 分数最高的候选
+
+    但为了避免把明显“不像最终答案”的文本直接送入 answer 轨迹，
+    这里仍保留一个最弱约束：
+    - 如果这一批里存在可解析数字答案，则只在可解析候选里比 verifier 分数
+    - 只有当整批都不可解析时，才退回到全候选里比 verifier 分数
+
+    这样训练和推理都会走同一套简单规则，不再混入：
+    - 共识数 bonus
+    - keep bonus / change penalty
+    - 复合 tie-break 逻辑
     """
     candidates = batch["candidates"]
     if not candidates:
         return 0, None
 
-    consensus_counts = _candidate_consensus_counts(candidates)
+    parseable_mask = [
+        extract_pred_num(cand["text"]) is not None
+        for cand in candidates
+    ]
+    require_parseable = any(parseable_mask)
     best_idx = 0
     best_meta = None
     accept_gate = verifier.get_accept_gate(question, history, incumbent_text)
@@ -519,32 +520,18 @@ def select_answer_candidate_index(
     for idx, cand in enumerate(candidates):
         candidate_pred = extract_pred_num(cand["text"])
         parseable = candidate_pred is not None
-        consensus_count = 0
-        accept_prob = 0.0
-        accept_margin = 0.0
-        keep_bonus = 0.0
-        change_penalty = 0.0
+        if require_parseable and not parseable:
+            continue
 
-        if parseable:
-            consensus_count = consensus_counts.get(round(float(candidate_pred), 6), 0)
-            if incumbent_text is not None:
-                accept_prob, _ = verifier.predict_accept_prob(
-                    question,
-                    history,
-                    incumbent_text,
-                    cand["text"],
-                )
-                accept_margin = accept_prob - accept_barrier
-                if incumbent_pred is not None:
-                    if abs(candidate_pred - incumbent_pred) <= 1e-6:
-                        keep_bonus = ANSWER_CANDIDATE_KEEP_BONUS
-                    else:
-                        change_penalty = ANSWER_CANDIDATE_CHANGE_PENALTY
+        accept_prob, _ = verifier.predict_accept_prob(
+            question,
+            history,
+            incumbent_text,
+            cand["text"],
+        )
+        accept_margin = accept_prob - accept_barrier
 
         score = (
-            1 if parseable else 0,
-            accept_margin + keep_bonus - change_penalty,
-            consensus_count,
             accept_prob,
             -idx,
         )
@@ -553,15 +540,17 @@ def select_answer_candidate_index(
             best_meta = {
                 "score": score,
                 "candidate_pred": candidate_pred,
-                "consensus_count": consensus_count,
+                "parseable_only_pool": require_parseable,
                 "accept_prob": accept_prob,
                 "accept_margin": accept_margin,
                 "accept_barrier": accept_barrier,
                 "gate_keep_prob": gate_keep_prob,
-                "keep_bonus": keep_bonus,
-                "change_penalty": change_penalty,
+                "keep_bonus": 0.0,
+                "change_penalty": 0.0,
             }
 
+    if best_meta is None:
+        return 0, None
     return best_idx, best_meta
 
 def maybe_print_answer_candidate_selection_debug(sample_idx, rnd, batch, selected_idx, meta):
@@ -571,179 +560,11 @@ def maybe_print_answer_candidate_selection_debug(sample_idx, rnd, batch, selecte
     selected_pred_str = "None" if meta["candidate_pred"] is None else f"{meta['candidate_pred']:.4f}"
     print(
         f"[候选选择] sample={sample_idx} rnd={rnd} selected_idx={selected_idx} "
-        f"selected_pred={selected_pred_str} consensus={meta['consensus_count']} "
+        f"selected_pred={selected_pred_str} parseable_only_pool={int(meta['parseable_only_pool'])} "
         f"accept_prob={meta['accept_prob']:.4f} accept_margin={meta['accept_margin']:.4f} "
         f"accept_barrier={meta['accept_barrier']:.4f} gate_keep_prob={meta['gate_keep_prob']:.4f} "
         f"keep_bonus={meta['keep_bonus']:.4f} change_penalty={meta['change_penalty']:.4f}"
     )
-
-def get_search_answer_constraint_profile(phase, keep_prob, incumbent_pred, rnd):
-    """
-    基于“当前 incumbent 有多不稳”动态调整 search 阶段的动作约束。
-
-    只用推理时可见信号：
-    - keep_prob
-    - incumbent 是否存在
-    - 当前轮次
-
-    目标：
-    - incumbent 缺失或明显不稳时，提高 answer 尝试率
-    - 同时保留 comment 探索，不把策略锁死成纯答题
-    """
-    answer_floor = SEARCH_MIN_ANSWER_PROB
-    silent_cap = SEARCH_MAX_SILENT_PROB
-
-    if phase != "search":
-        return answer_floor, silent_cap
-
-    if incumbent_pred is None:
-        answer_floor = max(answer_floor, SEARCH_NO_INCUMBENT_MIN_ANSWER_PROB)
-        silent_cap = min(silent_cap, SEARCH_NO_INCUMBENT_MAX_SILENT_PROB)
-    elif keep_prob >= SEARCH_STABLE_KEEP_PROB and rnd < NUM_ROUNDS:
-        answer_floor = min(answer_floor, SEARCH_STABLE_MAX_ANSWER_PROB)
-        silent_cap = min(silent_cap, SEARCH_MAX_SILENT_PROB)
-    elif keep_prob <= SEARCH_LOW_KEEP_PROB:
-        answer_floor = max(answer_floor, SEARCH_UNSTABLE_MIN_ANSWER_PROB)
-        silent_cap = min(silent_cap, SEARCH_UNSTABLE_MAX_SILENT_PROB)
-    elif keep_prob < SEARCH_RELAX_KEEP_PROB:
-        mix = (
-            (SEARCH_RELAX_KEEP_PROB - keep_prob)
-            / max(SEARCH_RELAX_KEEP_PROB - SEARCH_LOW_KEEP_PROB, 1e-6)
-        )
-        answer_floor = max(
-            answer_floor,
-            SEARCH_MIN_ANSWER_PROB + mix * (
-                SEARCH_UNSTABLE_MIN_ANSWER_PROB - SEARCH_MIN_ANSWER_PROB
-            ),
-        )
-        silent_cap = min(
-            silent_cap,
-            SEARCH_MAX_SILENT_PROB - mix * (
-                SEARCH_MAX_SILENT_PROB - SEARCH_UNSTABLE_MAX_SILENT_PROB
-            ),
-        )
-
-    if phase == "search" and is_late_round(rnd):
-        answer_floor = min(1.0, answer_floor + SEARCH_LATE_ROUND_ANSWER_BONUS)
-        silent_cap = min(silent_cap, SEARCH_UNSTABLE_MAX_SILENT_PROB)
-
-    return float(answer_floor), float(max(0.0, silent_cap))
-
-def apply_search_middle_strategy_constraints(
-    strategy,
-    allowed_actions,
-    phase,
-    keep_prob,
-    incumbent_pred,
-    rnd,
-):
-    """
-    仅在 search 状态下，对中层策略做两类约束：
-    - 给 pi0 / pi1 保留最低探索概率
-    - 不直接改 CFR 本体，只在采样/期望时使用这份约束后的策略
-    """
-    adjusted = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
-    allowed_set = set(allowed_actions)
-    if not allowed_set:
-        adjusted[MIDDLE_ACTION_SILENT] = 1.0
-        return adjusted
-
-    if phase != "search":
-        adjusted[:] = strategy
-        return adjusted
-
-    floors = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
-    answer_floor, silent_cap = get_search_answer_constraint_profile(
-        phase,
-        keep_prob,
-        incumbent_pred,
-        rnd,
-    )
-    if MIDDLE_ACTION_COMMENT in allowed_set:
-        floors[MIDDLE_ACTION_COMMENT] = SEARCH_MIN_COMMENT_PROB
-    if MIDDLE_ACTION_ANSWER in allowed_set:
-        floors[MIDDLE_ACTION_ANSWER] = answer_floor
-    if (
-        phase == "search"
-        and incumbent_pred is not None
-        and keep_prob >= SEARCH_STABLE_KEEP_PROB
-        and rnd < NUM_ROUNDS
-        and MIDDLE_ACTION_COMMENT in allowed_set
-    ):
-        floors[MIDDLE_ACTION_COMMENT] = max(
-            floors[MIDDLE_ACTION_COMMENT],
-            SEARCH_STABLE_MIN_COMMENT_PROB,
-        )
-
-    floor_sum = floors.sum()
-    if floor_sum >= 1.0:
-        adjusted[:] = floors / floor_sum
-        return adjusted
-
-    base = np.array(strategy, dtype=np.float64)
-    base[~np.isfinite(base)] = 0.0
-    base[base < 0.0] = 0.0
-    for act in range(CFR_NUM_ACTIONS):
-        if act not in allowed_set:
-            base[act] = 0.0
-
-    if MIDDLE_ACTION_SILENT in allowed_set:
-        base[MIDDLE_ACTION_SILENT] = min(
-            base[MIDDLE_ACTION_SILENT],
-            silent_cap,
-        )
-
-    adjusted[:] = floors
-    reserved_mass = adjusted.sum()
-    remaining_mass = max(1.0 - reserved_mass, 0.0)
-
-    extra = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
-    for act in allowed_set:
-        if act == MIDDLE_ACTION_SILENT:
-            extra[act] = base[act]
-        else:
-            extra[act] = max(base[act] - floors[act], 0.0)
-
-    extra_total = extra.sum()
-    if extra_total > 0.0:
-        adjusted += remaining_mass * (extra / extra_total)
-    else:
-        active_actions = [act for act in allowed_set if act != MIDDLE_ACTION_SILENT]
-        if not active_actions:
-            active_actions = list(allowed_set)
-        share = remaining_mass / max(len(active_actions), 1)
-        for act in active_actions:
-            adjusted[act] += share
-
-    if MIDDLE_ACTION_ANSWER in allowed_set and incumbent_pred is not None and keep_prob >= SEARCH_STABLE_KEEP_PROB and rnd < NUM_ROUNDS:
-        if adjusted[MIDDLE_ACTION_ANSWER] > SEARCH_STABLE_MAX_ANSWER_PROB:
-            overflow = adjusted[MIDDLE_ACTION_ANSWER] - SEARCH_STABLE_MAX_ANSWER_PROB
-            adjusted[MIDDLE_ACTION_ANSWER] = SEARCH_STABLE_MAX_ANSWER_PROB
-            redistribute_targets = [act for act in allowed_set if act == MIDDLE_ACTION_COMMENT]
-            if redistribute_targets:
-                share = overflow / len(redistribute_targets)
-                for act in redistribute_targets:
-                    adjusted[act] += share
-
-    if MIDDLE_ACTION_SILENT in allowed_set and adjusted[MIDDLE_ACTION_SILENT] > silent_cap:
-        overflow = adjusted[MIDDLE_ACTION_SILENT] - silent_cap
-        adjusted[MIDDLE_ACTION_SILENT] = silent_cap
-        redistribute_targets = [
-            act for act in allowed_set
-            if act in (MIDDLE_ACTION_COMMENT, MIDDLE_ACTION_ANSWER)
-        ]
-        if redistribute_targets:
-            share = overflow / len(redistribute_targets)
-            for act in redistribute_targets:
-                adjusted[act] += share
-
-    total = adjusted.sum()
-    if total > 0.0:
-        adjusted /= total
-    else:
-        fallback_action = next(iter(allowed_set))
-        adjusted[fallback_action] = 1.0
-    return adjusted
 
 def classify_round_transition(previous_pred, current_pred, gt):
     previous_reward = reward_from_pred(previous_pred, gt)
@@ -833,15 +654,9 @@ def get_constrained_middle_strategy(
             incumbent_pred,
             allow_silent=allow_silent,
         )
-    raw_strategy = selector.get_current_strategy(state, allowed_actions)
-    strategy = apply_search_middle_strategy_constraints(
-        raw_strategy,
-        allowed_actions,
-        phase,
-        keep_prob=keep_prob,
-        incumbent_pred=incumbent_pred,
-        rnd=rnd,
-    )
+    # 兼容旧函数名保留接口；当前中层直接使用最朴素的 regret-matching
+    # 原始策略，不再额外施加 search 状态下的 floor / cap 约束。
+    strategy = selector.get_current_strategy(state, allowed_actions)
     return state, allowed_actions, strategy
 
 def choose_middle_action(
@@ -1456,14 +1271,54 @@ def average_policy_stack_answer_reward(agent_bundle, question, history, gt, num_
         rewards.append(reward_from_pred(answer_pred, gt))
     return sum(rewards) / len(rewards) if rewards else 0.0
 
-def estimate_policy_stack_answer_value(agent_bundle, question, history, gt, num_samples=1):
-    return average_policy_stack_answer_reward(
+def estimate_middle_silent_baseline(
+    agent_bundle,
+    question,
+    history,
+    rnd,
+    incumbent_pred,
+    gt,
+    num_samples,
+):
+    """
+    中层动作 value 的共享静默基线：
+
+        B(s) = E[next_answer_reward | 当前状态 s 下本轮选择 silent]
+    """
+    return average_next_answer_reward(
         agent_bundle,
         question,
         history,
+        min(rnd + 1, NUM_ROUNDS),
+        incumbent_pred,
         gt,
         num_samples,
     )
+
+def compute_centered_answer_candidate_values(batch, gt, silent_baseline):
+    values = []
+    for cand in batch["candidates"]:
+        candidate_pred = extract_pred_num(cand["text"])
+        values.append(reward_from_pred(candidate_pred, gt) - silent_baseline)
+    return values
+
+def sample_counterfactual_policy_batch(agent, question, history, prompt_override=None):
+    """
+    只读反事实采样：
+    - 不写 agent.last_update
+    - 不污染真实轨迹这一步已经记录的 selected_text / best_text
+    """
+    query_context = build_context(question, history)
+    candidates = agent.act(query_context, prompt_override=prompt_override)
+    if not candidates:
+        raise RuntimeError("反事实采样未返回任何候选。")
+    return {
+        "query_context": query_context,
+        "prompt_override": prompt_override,
+        "candidates": candidates,
+        "selected_idx": 0,
+        "selected_text": candidates[0]["text"],
+    }
 
 def estimate_policy_stack_comment_value(
     agent_bundle,
@@ -1475,6 +1330,7 @@ def estimate_policy_stack_comment_value(
     num_samples,
     comment_text=None,
     speaker="pi0_cf",
+    silent_baseline=None,
 ):
     """
     comment 的价值恢复为旧定义：
@@ -1482,15 +1338,16 @@ def estimate_policy_stack_comment_value(
         with_comment 的下一次 answer 的 r
         - without_comment 的下一次 answer 的 r
     """
-    without_comment_reward = average_next_answer_reward(
-        agent_bundle,
-        question,
-        history,
-        min(rnd + 1, NUM_ROUNDS),
-        incumbent_pred,
-        gt,
-        num_samples,
-    )
+    if silent_baseline is None:
+        silent_baseline = estimate_middle_silent_baseline(
+            agent_bundle,
+            question,
+            history,
+            rnd,
+            incumbent_pred,
+            gt,
+            num_samples,
+        )
     if comment_text is None:
         comment_text = agent_bundle["pi0"].sample_text(
             build_context(question, history),
@@ -1512,9 +1369,25 @@ def estimate_policy_stack_comment_value(
         gt,
         num_samples,
     )
-    return with_comment_reward - without_comment_reward
+    return with_comment_reward - silent_baseline
 
-def compute_policy_stack_comment_candidate_rewards(step, agent_bundle, incumbent_pred, gt):
+def compute_policy_stack_comment_candidate_rewards(
+    step,
+    agent_bundle,
+    incumbent_pred,
+    gt,
+    silent_baseline=None,
+):
+    if silent_baseline is None:
+        silent_baseline = estimate_middle_silent_baseline(
+            agent_bundle,
+            step["question"],
+            step["pre_history"],
+            step["round"],
+            incumbent_pred,
+            gt,
+            GSPO_COMMENT_EVAL_SAMPLES,
+        )
     rewards = []
     for cand in step["batch"]["candidates"]:
         rewards.append(
@@ -1528,124 +1401,10 @@ def compute_policy_stack_comment_candidate_rewards(step, agent_bundle, incumbent
                 GSPO_COMMENT_EVAL_SAMPLES,
                 comment_text=cand["text"],
                 speaker=step["speaker"],
+                silent_baseline=silent_baseline,
             )
         )
     return rewards
-
-def build_non_silent_strategy(strategy, allowed_actions):
-    non_silent_actions = [
-        act
-        for act in allowed_actions
-        if act != MIDDLE_ACTION_SILENT
-    ]
-    non_silent_strategy = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
-    if not non_silent_actions:
-        return non_silent_strategy, non_silent_actions
-
-    mass = float(sum(strategy[act] for act in non_silent_actions))
-    if mass > 0.0:
-        for act in non_silent_actions:
-            non_silent_strategy[act] = strategy[act] / mass
-    else:
-        share = 1.0 / len(non_silent_actions)
-        for act in non_silent_actions:
-            non_silent_strategy[act] = share
-    return non_silent_strategy, non_silent_actions
-
-def sample_policy_stack_answer_absolute_reward(agent_bundle, question, history, incumbent_pred, gt):
-    """
-    单次 rollout 一个 answer，并返回“最近 answer 的绝对 reward”。
-    """
-    answer_text = agent_bundle["pi1"].sample_text(
-        build_context(question, history),
-        prompt_override=PI1_PROMPT,
-    )
-    answer_pred = extract_pred_num(answer_text)
-    return rollout_terminal_absolute_reward(answer_pred, incumbent_pred, gt)
-
-def sample_policy_stack_next_answer_reward_after_comment(
-    agent_bundle,
-    question,
-    history,
-    rnd,
-    incumbent_pred,
-    gt,
-):
-    comment_text = agent_bundle["pi0"].sample_text(
-        build_context(question, history),
-        prompt_override=PI0_PROMPT,
-    )
-    next_history = append_round_output(
-        history,
-        rnd,
-        "pi0_silent_cf",
-        comment_text,
-        "comment",
-    )
-    return sample_policy_stack_answer_absolute_reward(
-        agent_bundle,
-        question,
-        next_history,
-        incumbent_pred,
-        gt,
-    )
-
-def estimate_policy_stack_silent_without_reward(
-    agent_bundle,
-    question,
-    history,
-    rnd,
-    incumbent_pred,
-    gt,
-    strategy,
-    allowed_actions,
-    num_samples,
-):
-    """
-    不选 silent 时，把当前策略在 comment / answer 上重新归一化后抽样 rollout，
-    估计得到的“最近 answer 的 r”。
-    """
-    non_silent_strategy, non_silent_actions = build_non_silent_strategy(
-        strategy,
-        allowed_actions,
-    )
-    if not non_silent_actions:
-        return average_next_answer_reward(
-            agent_bundle,
-            question,
-            history,
-            min(rnd + 1, NUM_ROUNDS),
-            incumbent_pred,
-            gt,
-            num_samples,
-        )
-
-    rewards = []
-    num_samples = max(int(num_samples), 1)
-    for _ in range(num_samples):
-        sampled_action = int(np.random.choice(CFR_NUM_ACTIONS, p=non_silent_strategy))
-        if sampled_action == MIDDLE_ACTION_COMMENT:
-            rewards.append(
-                sample_policy_stack_next_answer_reward_after_comment(
-                    agent_bundle,
-                    question,
-                    history,
-                    rnd,
-                    incumbent_pred,
-                    gt,
-                )
-            )
-        else:
-            rewards.append(
-                sample_policy_stack_answer_absolute_reward(
-                    agent_bundle,
-                    question,
-                    history,
-                    incumbent_pred,
-                    gt,
-                )
-            )
-    return sum(rewards) / len(rewards) if rewards else 0.0
 
 def estimate_policy_stack_silent_value(
     agent_bundle,
@@ -1658,126 +1417,113 @@ def estimate_policy_stack_silent_value(
     allowed_actions=None,
 ):
     """
-    silent 的价值定义为：
+    中层策略现在退化为最朴素的 regret matching。
 
-        with_silent 的下一次 answer 的 r
-        - 按当前 comment / answer 归一化策略抽样 rollout 得到的 answer 的 r
+    在这个版本里：
+    - comment 继续使用 GSPO 层定义的边际价值
+    - answer 继续使用 GSPO 层定义的答案质量
+    - silent 作为 no-op 基线动作，其额外价值固定记为 0
+
+    这样：
+    - comment > 0 表示“比静默更有帮助”
+    - comment < 0 表示“这条 comment 还不如不说”
+    - regret 更新只需直接比较三动作 value，不再混入额外 rollout 基线
     """
-    if allowed_actions is None:
-        allowed_actions = get_middle_allowed_actions(
-            rnd,
-            incumbent_pred,
-            allow_silent=True,
-        )
-    with_silent_reward = average_next_answer_reward(
-        agent_bundle,
-        question,
-        history,
-        min(rnd + 1, NUM_ROUNDS),
-        incumbent_pred,
-        gt,
-        GSPO_COMMENT_EVAL_SAMPLES,
-    )
-    without_silent_reward = estimate_policy_stack_silent_without_reward(
-        agent_bundle,
-        question,
-        history,
-        rnd,
-        incumbent_pred,
-        gt,
-        strategy,
-        allowed_actions,
-        GSPO_COMMENT_EVAL_SAMPLES,
-    )
-    return with_silent_reward - without_silent_reward
+    return 0.0
 
-def estimate_outer_answer_value(
+def estimate_policy_stack_answer_value(
     agent_bundle,
-    verifier,
     question,
     history,
-    incumbent_text,
+    rnd,
     incumbent_pred,
     gt,
-    rnd,
-    num_samples=1,
+    silent_baseline=None,
+    num_batches=1,
 ):
-    """
-    外层 agent 的价值看“本轮结束后最近 answer 的 r”。
-
-    如果 answer 没被接受，就仍然保持当前 incumbent 的 r。
-    """
-    current_reward = reward_from_pred(incumbent_pred, gt)
-    rewards = []
-    num_samples = max(int(num_samples), 1)
-    for _ in range(num_samples):
-        candidate_text = agent_bundle["pi1"].sample_text(
-            build_context(question, history),
+    if silent_baseline is None:
+        silent_baseline = estimate_middle_silent_baseline(
+            agent_bundle,
+            question,
+            history,
+            rnd,
+            incumbent_pred,
+            gt,
+            GSPO_COMMENT_EVAL_SAMPLES,
+        )
+    batch_means = []
+    num_batches = max(int(num_batches), 1)
+    for _ in range(num_batches):
+        batch = sample_counterfactual_policy_batch(
+            agent_bundle["pi1"],
+            question,
+            history,
             prompt_override=PI1_PROMPT,
         )
-        candidate_pred = extract_pred_num(candidate_text)
-        decision = evaluate_answer_revision(
-            verifier,
-            question,
-            rnd,
-            history,
-            incumbent_text,
-            incumbent_pred,
-            candidate_text,
-            candidate_pred,
-            gt,
-        )
-        rewards.append(
-            reward_from_pred(candidate_pred, gt) if decision["accept"] else current_reward
-        )
-    return sum(rewards) / len(rewards) if rewards else current_reward
+        values = compute_centered_answer_candidate_values(batch, gt, silent_baseline)
+        batch_means.append(sum(values) / len(values) if values else 0.0)
+    return sum(batch_means) / len(batch_means) if batch_means else 0.0
 
-def estimate_outer_agent_value(
-    middle_cfr,
-    agents,
-    verifier,
+def estimate_policy_stack_comment_value_mean(
+    agent_bundle,
     question,
-    gt,
-    phase,
-    agent_idx,
-    rnd,
     history,
-    incumbent_text,
+    rnd,
     incumbent_pred,
-    keep_prob,
-    allow_silent=True,
+    gt,
+    silent_baseline=None,
+    num_batches=1,
 ):
-    """
-    外层每个 agent 的价值定义为“本轮结束后最近 answer 的 r”。
-    """
-    current_reward = reward_from_pred(incumbent_pred, gt)
-    _, allowed_actions, middle_strategy = get_constrained_middle_strategy(
-        middle_cfr,
-        phase,
-        rnd,
-        agent_idx,
-        incumbent_pred,
-        keep_prob,
-        allow_silent=allow_silent,
-    )
-    action_values = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
-    if MIDDLE_ACTION_SILENT in allowed_actions:
-        action_values[MIDDLE_ACTION_SILENT] = current_reward
-    if MIDDLE_ACTION_COMMENT in allowed_actions:
-        action_values[MIDDLE_ACTION_COMMENT] = current_reward
-    if MIDDLE_ACTION_ANSWER in allowed_actions:
-        action_values[MIDDLE_ACTION_ANSWER] = estimate_outer_answer_value(
-            agents[agent_idx],
-            verifier,
+    if silent_baseline is None:
+        silent_baseline = estimate_middle_silent_baseline(
+            agent_bundle,
             question,
             history,
-            incumbent_text,
+            rnd,
             incumbent_pred,
             gt,
-            rnd,
-            num_samples=1,
+            GSPO_COMMENT_EVAL_SAMPLES,
         )
-    return float(np.dot(action_values, middle_strategy))
+    batch_means = []
+    num_batches = max(int(num_batches), 1)
+    for _ in range(num_batches):
+        batch = sample_counterfactual_policy_batch(
+            agent_bundle["pi0"],
+            question,
+            history,
+            prompt_override=PI0_PROMPT,
+        )
+        step = {
+            "question": question,
+            "pre_history": history,
+            "round": rnd,
+            "speaker": "pi0_cf_batch",
+            "batch": batch,
+        }
+        rewards = compute_policy_stack_comment_candidate_rewards(
+            step,
+            agent_bundle,
+            incumbent_pred,
+            gt,
+            silent_baseline=silent_baseline,
+        )
+        batch_means.append(sum(rewards) / len(rewards) if rewards else 0.0)
+    return sum(batch_means) / len(batch_means) if batch_means else 0.0
+
+def compute_outer_agent_value(middle_action_values, middle_strategy):
+    """
+    外层每个 agent 的动作价值：
+
+        V_outer(agent, s) = sum_a pi_middle(a | agent, s) * Q_middle(agent, a, s)
+
+    也就是当前中层策略下，该 agent 三个中层动作 value 的加权平均。
+    """
+    return float(
+        np.dot(
+            np.asarray(middle_action_values, dtype=np.float64),
+            np.asarray(middle_strategy, dtype=np.float64),
+        )
+    )
 
 def estimate_middle_action_values(
     question,
@@ -1804,6 +1550,8 @@ def estimate_middle_action_values(
       那么这里直接复用，不再为这个动作再跑一遍反事实 rollout。
     - 这样中层 regret 更新和外层调度更新就能共享同一轮里的价值估计，
       避免 selected agent 的 chosen action 被重复计算。
+    - 对未选中的 comment / answer，会额外采样多个 counterfactual batch
+      再取均值，降低单批采样噪声。
     """
     allowed_actions = get_middle_allowed_actions(
         rnd,
@@ -1812,29 +1560,29 @@ def estimate_middle_action_values(
     )
     values = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
     agent_bundle = agents[selected_agent]
-    _, allowed_actions, middle_strategy = get_constrained_middle_strategy(
-        middle_cfr,
-        phase,
+    silent_baseline = estimate_middle_silent_baseline(
+        agent_bundle,
+        question,
+        history,
         rnd,
-        selected_agent,
         incumbent_pred,
-        keep_prob,
-        allow_silent=allow_silent,
-        allowed_actions=allowed_actions,
+        gt,
+        GSPO_COMMENT_EVAL_SAMPLES,
     )
 
     if MIDDLE_ACTION_COMMENT in allowed_actions:
         if known_action == MIDDLE_ACTION_COMMENT and known_value is not None:
             values[MIDDLE_ACTION_COMMENT] = known_value
         else:
-            values[MIDDLE_ACTION_COMMENT] = estimate_policy_stack_comment_value(
+            values[MIDDLE_ACTION_COMMENT] = estimate_policy_stack_comment_value_mean(
                 agent_bundle,
                 question,
                 history,
                 rnd,
                 incumbent_pred,
                 gt,
-                GSPO_COMMENT_EVAL_SAMPLES,
+                silent_baseline=silent_baseline,
+                num_batches=MIDDLE_CF_NUM_BATCHES,
             )
     if MIDDLE_ACTION_ANSWER in allowed_actions:
         if known_action == MIDDLE_ACTION_ANSWER and known_value is not None:
@@ -1844,8 +1592,11 @@ def estimate_middle_action_values(
                 agent_bundle,
                 question,
                 history,
+                rnd,
+                incumbent_pred,
                 gt,
-                num_samples=1,
+                silent_baseline=silent_baseline,
+                num_batches=MIDDLE_CF_NUM_BATCHES,
             )
     if MIDDLE_ACTION_SILENT in allowed_actions:
         if known_action == MIDDLE_ACTION_SILENT and known_value is not None:
@@ -1858,7 +1609,7 @@ def estimate_middle_action_values(
                 rnd,
                 incumbent_pred,
                 gt,
-                middle_strategy,
+                None,
                 allowed_actions=allowed_actions,
             )
     return values, allowed_actions
@@ -2002,8 +1753,6 @@ def run_three_layer_realized_action(
       这一轮执行完后的新历史
     - realized_value:
       中层 / 内层学习用的动作价值
-    - outer_value:
-      外层调度器看的“本轮结束后最近 answer 的 r”
     - accept_update_payload:
       给 accept_head 做在线更新时需要的监督信号
     - gspo_update_payload:
@@ -2022,7 +1771,6 @@ def run_three_layer_realized_action(
     accept_margin = -VERIFIER_ACCEPT_THRESHOLD
     accept_reason = "not_answer"
     realized_middle_value = 0.0
-    realized_outer_value = 0.0
     step = None
     accept_update_payload = None
     gspo_update_payload = None
@@ -2030,7 +1778,7 @@ def run_three_layer_realized_action(
     incumbent_text = pre_incumbent_text
     incumbent_pred = pre_incumbent_pred
     incumbent_reward = reward_from_pred(incumbent_pred, gt)
-    realized_outer_value = incumbent_reward
+    silent_baseline = None
 
     if act == MIDDLE_ACTION_SILENT:
         realized_middle_value = estimate_policy_stack_silent_value(
@@ -2050,6 +1798,15 @@ def run_three_layer_realized_action(
             "silent",
         )
     elif act == MIDDLE_ACTION_COMMENT:
+        silent_baseline = estimate_middle_silent_baseline(
+            agents[selected_agent],
+            question,
+            pre_history,
+            rnd,
+            pre_incumbent_pred,
+            gt,
+            GSPO_COMMENT_EVAL_SAMPLES,
+        )
         step = sample_gspo_step(
             agents[selected_agent]["pi0"],
             question,
@@ -2064,6 +1821,7 @@ def run_three_layer_realized_action(
             agents[selected_agent],
             pre_incumbent_pred,
             gt,
+            silent_baseline=silent_baseline,
         )
         gspo_update_payload = (
             step["agent"],
@@ -2082,6 +1840,15 @@ def run_three_layer_realized_action(
             "comment",
         )
     else:
+        silent_baseline = estimate_middle_silent_baseline(
+            agents[selected_agent],
+            question,
+            pre_history,
+            rnd,
+            pre_incumbent_pred,
+            gt,
+            GSPO_COMMENT_EVAL_SAMPLES,
+        )
         step = sample_gspo_step(
             agents[selected_agent]["pi1"],
             question,
@@ -2094,6 +1861,15 @@ def run_three_layer_realized_action(
         has_answer_candidates = bool(step["batch"]["candidates"])
         selected_idx = 0
         selected_meta = None
+        if has_answer_candidates:
+            selected_idx, selected_meta = select_answer_candidate_index(
+                verifier,
+                question,
+                pre_history,
+                pre_incumbent_text,
+                pre_incumbent_pred,
+                step["batch"],
+            )
         set_sampled_batch_selected_candidate(
             step["agent"],
             step["batch"],
@@ -2122,6 +1898,11 @@ def run_three_layer_realized_action(
             step["batch"],
             answer_rewards,
         )
+        middle_answer_values = compute_centered_answer_candidate_values(
+            step["batch"],
+            gt,
+            silent_baseline,
+        )
         current_pred = extract_pred_num(step["selected_text"])
         decision = evaluate_answer_revision(
             verifier,
@@ -2134,7 +1915,7 @@ def run_three_layer_realized_action(
             current_pred,
             gt,
         )
-        realized_middle_value = answer_rewards[step["batch"]["selected_idx"]]
+        realized_middle_value = middle_answer_values[step["batch"]["selected_idx"]]
         accepted = decision["accept"]
         verifier_prob = decision["verifier_prob"]
         accept_threshold = decision["accept_threshold"]
@@ -2177,8 +1958,6 @@ def run_three_layer_realized_action(
                 "候选修订未通过 verifier，保持 incumbent 不变。",
                 "meta",
             )
-        realized_outer_value = incumbent_reward
-
     return {
         "history": history,
         "incumbent_text": incumbent_text,
@@ -2193,7 +1972,6 @@ def run_three_layer_realized_action(
         "accept_margin": accept_margin,
         "accept_reason": accept_reason,
         "realized_value": realized_middle_value,
-        "outer_value": realized_outer_value,
         "step": step,
         "accept_update_payload": accept_update_payload,
         "gspo_update_payload": gspo_update_payload,
@@ -2216,13 +1994,13 @@ def update_three_layer_regrets(
     allowed_agents,
     middle_state,
     allowed_actions,
+    selected_middle_strategy,
     pre_history,
     pre_incumbent_text,
     pre_incumbent_pred,
     keep_prob,
     allow_silent,
     realized_value,
-    outer_realized_value,
 ):
     """
     统一做“中层 regret 更新 + 外层 regret 更新”。
@@ -2236,15 +2014,16 @@ def update_three_layer_regrets(
       当前 selected_agent 在本 state 下，三种动作各自会有多大价值
     - outer_action_values:
       当前 phase 下，如果这轮换不同 agent 出场，
-      “本轮结束后最近 answer 的 r”分别是多少
+      各 agent 在“当前中层策略下的期望中层 value”分别是多少
     """
     middle_estimate_cache = {}
+    selected_allowed_actions = list(allowed_actions)
 
-    if len(allowed_actions) == 1:
+    if len(selected_allowed_actions) == 1:
         middle_action_values = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
         middle_action_values[act] = realized_value
     else:
-        middle_action_values, allowed_actions = get_cached_middle_estimate(
+        middle_action_values, selected_allowed_actions = get_cached_middle_estimate(
             middle_estimate_cache,
             question,
             gt,
@@ -2262,44 +2041,59 @@ def update_three_layer_regrets(
             known_action=act,
             known_value=realized_value,
         )
+    outer_action_values = None
+    if outer_cfr is not None:
+        outer_action_values = np.zeros(len(allowed_agents), dtype=np.float64)
+        for agent_idx in allowed_agents:
+            if agent_idx == selected_agent:
+                agent_middle_strategy = selected_middle_strategy
+                agent_middle_values = middle_action_values
+            else:
+                _, agent_allowed_actions, agent_middle_strategy = get_constrained_middle_strategy(
+                    middle_cfr,
+                    phase,
+                    rnd,
+                    agent_idx,
+                    pre_incumbent_pred,
+                    keep_prob,
+                    allow_silent=allow_silent,
+                )
+                agent_middle_values, _ = get_cached_middle_estimate(
+                    middle_estimate_cache,
+                    question,
+                    gt,
+                    agents,
+                    middle_cfr,
+                    phase,
+                    agent_idx,
+                    rnd,
+                    pre_history,
+                    pre_incumbent_text,
+                    pre_incumbent_pred,
+                    verifier,
+                    keep_prob,
+                    allow_silent,
+                )
+            outer_action_values[agent_idx] = compute_outer_agent_value(
+                agent_middle_values,
+                agent_middle_strategy,
+            )
+
+    if len(selected_allowed_actions) > 1:
         middle_cfr.update_regret(
             middle_state,
             act,
             middle_action_values,
-            allowed_actions=allowed_actions,
+            allowed_actions=selected_allowed_actions,
         )
 
-    if outer_cfr is None:
-        return
-
-    outer_action_values = np.zeros(len(allowed_agents), dtype=np.float64)
-    for agent_idx in allowed_agents:
-        if agent_idx == selected_agent:
-            outer_action_values[agent_idx] = outer_realized_value
-            continue
-
-        outer_action_values[agent_idx] = estimate_outer_agent_value(
-            middle_cfr,
-            agents,
-            verifier,
-            question,
-            gt,
-            phase,
-            agent_idx,
-            rnd,
-            pre_history,
-            pre_incumbent_text,
-            pre_incumbent_pred,
-            keep_prob,
-            allow_silent,
+    if outer_cfr is not None:
+        outer_cfr.update_regret(
+            outer_state,
+            selected_agent,
+            outer_action_values,
+            allowed_actions=allowed_agents,
         )
-
-    outer_cfr.update_regret(
-        outer_state,
-        selected_agent,
-        outer_action_values,
-        allowed_actions=allowed_agents,
-    )
 
 def apply_three_layer_policy_updates(
     verifier,
@@ -2904,9 +2698,10 @@ def run_policy_stack_experiment(
                 )
             else:
                 outer_state = None
-                allowed_agents = [0]
-                outer_strategy = np.array([1.0], dtype=np.float64)
-                selected_agent = 0
+                allowed_agents = list(range(resolved_num_agents))
+                selected_agent = (rnd - 1) % max(resolved_num_agents, 1)
+                outer_strategy = np.zeros(resolved_num_agents, dtype=np.float64)
+                outer_strategy[selected_agent] = 1.0
 
             middle_state, allowed_actions, middle_strategy, act = choose_middle_action(
                 middle_cfr,
@@ -2955,13 +2750,13 @@ def run_policy_stack_experiment(
                     allowed_agents,
                     middle_state,
                     allowed_actions,
+                    middle_strategy,
                     pre_history,
                     pre_incumbent_text,
                     pre_incumbent_pred,
                     keep_prob,
                     resolved_allow_silent,
                     round_result["realized_value"],
-                    round_result["outer_value"],
                 )
                 maybe_print_three_layer_stage(idx, rnd, "middle_regret", round_start_time)
                 if use_outer_scheduler:
@@ -3108,7 +2903,7 @@ def run_middle_layer(
         data,
         runtime=runtime,
         use_outer_scheduler=False,
-        num_agents=1,
+        num_agents=NUM_AGENTS,
         allow_silent=True,
         update_params=update_params,
         log_metrics=log_metrics,
@@ -3132,7 +2927,7 @@ def run_middle_layer_no_silent(
         data,
         runtime=runtime,
         use_outer_scheduler=False,
-        num_agents=1,
+        num_agents=NUM_AGENTS,
         allow_silent=False,
         update_params=update_params,
         log_metrics=log_metrics,

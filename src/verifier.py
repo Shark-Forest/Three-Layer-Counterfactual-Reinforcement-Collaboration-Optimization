@@ -36,22 +36,32 @@ class OnlineAnswerVerifier:
         self.embedding_cache = {}
 
         model_path = VERIFIER_EMBED_MODEL_PATH
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"verifier embedding 模型路径不存在: {model_path}"
+        model_source = model_path if os.path.exists(model_path) else VERIFIER_EMBED_MODEL_ID
+        load_kwargs = {
+            "cache_dir": MODEL_CACHE,
+        }
+        if model_source == model_path:
+            load_kwargs["local_files_only"] = True
+
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_source,
+                **load_kwargs,
             )
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            local_files_only=True,
-        )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.model = AutoModel.from_pretrained(
-            model_path,
-            local_files_only=True,
-        )
+            self.model = AutoModel.from_pretrained(
+                model_source,
+                **load_kwargs,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "加载 verifier embedding 模型失败。"
+                f" 已尝试 source={model_source!r}。"
+                f" 如需离线运行，请预先把模型放到 {model_path}，"
+                " 或通过 MAS_VERIFIER_EMBED_MODEL / MAS_VERIFIER_EMBED_MODEL_PATH 覆盖来源。"
+            ) from exc
         self.model.to(self.device)
         self.model.eval()
 

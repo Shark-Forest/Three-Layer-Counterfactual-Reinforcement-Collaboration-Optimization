@@ -71,7 +71,8 @@
 - 动作空间：agent 索引
 - 仅在 `全量策略` 中启用
 
-在 `中间层策略+GSPO` 和 `中间层策略+GSPO（无沉默）` 中，这一层被移除，系统固定只有一个 agent bundle。
+在 `中间层策略+GSPO` 和 `中间层策略+GSPO（无沉默）` 中，这一层被移除；
+但系统仍保留多个 agent bundle，并按轮次做 round-robin 轮询，而不是固定只用一个 bundle。
 
 ### 3.2 中间层：动作策略
 
@@ -89,6 +90,13 @@
 - `answer` 对应 `pi1`
 - `silent` 没有文本输出策略参数，因此不会进入最内层 GSPO 更新
 
+当前中层直接使用最朴素的 regret-matching：
+
+- 每个状态维护 `silent / comment / answer` 的累计遗憾
+- 采样时直接按“正遗憾归一化”得到当前策略
+- 如果所有正遗憾都为 0，则在允许动作上均匀采样
+- 不再额外施加 `search` 状态下的概率 floor / cap 约束
+
 另外还有两组“无沉默”消融：
 
 - `中间层策略+GSPO（无沉默）`
@@ -105,6 +113,17 @@
 
 训练算法为 GSPO。它对同一上下文采样多个候选，在组内依据 reward/value 更新策略。
 
+对共享策略栈路径（`中间层策略+GSPO`、`中间层策略+GSPO（无沉默）`、`全量策略`、`全量策略（中层无沉默）`）而言，
+`pi1(answer)` 进入真实轨迹的规则现在统一为：
+
+- 先采样一批 answer 候选
+- 如果其中存在可解析数字答案，只在这些可解析候选里选择 `verifier` 分数最高的那个
+- 如果整批都不可解析，则退回到全候选里选择 `verifier` 分数最高的那个
+
+也就是说，这几条共享策略栈实验里，训练、验证、测试都使用同一套“真实轨迹选答”机制，避免训练/推理不一致。
+
+`单LLM GSPO` 和 `双LLM GSPO轮询` 不带 verifier 候选重排，仍默认使用该次采样 batch 的第一个候选推进真实轨迹。
+
 ## 4. verifier 的作用
 
 verifier 实现在 [src/verifier.py](src/verifier.py)。
@@ -120,12 +139,13 @@ verifier 实现在 [src/verifier.py](src/verifier.py)。
    - `search`
    - `stabilize`
 
-2. 决定 answer 候选是否可以接管当前 incumbent
+2. 在共享策略栈实验中，为 answer 候选提供打分，并决定被选中的 answer 是否可以接管当前 incumbent
 
 当前逻辑下：
 
 - `keep_prob = scorer(question, incumbent_answer)`
 - `accept_prob = scorer(question, candidate_answer)`
+- 真实轨迹里先按 `accept_prob` 选择候选 answer
 - 如果 `accept_prob > keep_prob`，则候选答案允许接管 incumbent
 
 也就是说，verifier 不直接看 comment，而是只看“题目 + 答案 utterance 本身”。
@@ -159,6 +179,8 @@ GSM8K 现在统一采用：
 2. `val` 上只验证，不更新
 3. `test` 上最终评估
 
+其中，共享策略栈路径在 `train / val / test` 三个阶段都共用同一套 answer 进入真实轨迹的选择规则；差别只在于 `train` 会额外做 CFR / GSPO / verifier 参数更新，而 `val / test` 不更新。
+
 ### 5.3 哪些实验只做测试
 
 不训练参数的基线实验有 2 组：
@@ -191,7 +213,7 @@ GSM8K 现在统一采用：
 
 `with comment 的下一次 answer 的 reward - without comment 的下一次 answer 的 reward`
 
-对应实现见 [run_all.py](run_all.py#L1397) 和 [run_all.py](run_all.py#L2669)。
+对应实现见 [run_all.py](run_all.py#L1212) 和 [run_all.py](run_all.py#L2504)。
 
 ### 6.3 中间层策略+GSPO / 中间层策略+GSPO（无沉默） / 全量策略 / 全量策略（中层无沉默）中的 value 定义
 
@@ -199,37 +221,38 @@ GSM8K 现在统一采用：
 
 #### answer 的 value
 
-`answer` 的 value 直接定义为答案质量 `r`。
+`answer` 的中层 value 定义为：
 
-实现见 [run_all.py](run_all.py#L1288)。
+`这次 answer 的 reward - 当前状态下 silent 的基线 reward`
+
+其中 silent 基线是：
+
+`B(s) = E[next_answer_reward | 当前状态 s 下本轮选择 silent]`
+
+实现见 [run_all.py](run_all.py#L1298)。
 
 #### comment 的 value
 
-`comment` 的 value 当前恢复为旧定义：
+`comment` 的中层 value 定义为：
 
-`with comment 的下一次 answer 的 r - without comment 的下一次 answer 的 r`
+`with comment 的下一次 answer 的 r - 当前状态下 silent 的基线 reward`
 
-实现见 [run_all.py](run_all.py#L1468)。
+也就是说，这里仍然是“comment 是否提升后续 answer”；
+只是现在 answer 和 comment 都统一减去同一个 silent 基线，进入同一坐标系里比较。
+
+实现见 [run_all.py](run_all.py#L1467)。
 
 #### silent 的 value
 
-`silent` 的 value 定义为：
+`silent` 的 value 现在固定定义为 `0`。
 
-`with silent 的下一次 answer 的 r - 按当前 comment/answer 归一化策略抽样 rollout 得到的 answer 的 r`
+含义是：
 
-也就是说：
+- `silent` 被当作 no-op 基线动作
+- `comment` 的 value 继续表示“比不说话额外带来多少帮助”
+- `answer` 的 value 表示“这次直接答，比本轮静默后再答好多少”
 
-- `with silent`
-  本轮静默，不立刻发 comment / answer，然后看下一次 answer 的结果
-
-- `without silent`
-  因为这一轮已经选定了该 agent，所以如果不选 silent，就只可能在 `comment` 和 `answer` 之间选择
-  此时把当前策略在 `comment / answer` 上重新归一化后进行抽样 rollout，得到下一次 answer 的 reward
-
-主体实现见：
-
-- [run_all.py](run_all.py#L1593)
-- [run_all.py](run_all.py#L1650)
+这样中层的 regret 比较就退化成最直接的三动作 value 比较，不再混入额外 rollout 基线。
 
 在两组“无沉默”实验中，中层动作空间不包含 `silent`，因此不会对 `silent` 做选择或更新；但其余 value 和反事实遗憾的定义与共享策略栈保持一致。
 
@@ -237,24 +260,44 @@ GSM8K 现在统一采用：
 
 中层三动作的反事实比较使用上述 value：
 
-- `comment` 和 `answer` 的反事实基于它们各自 value
-- `silent` 的反事实基于上面的 silent value
+- 已选动作：
+  - 使用这轮真实采样里真正被选中的那个 candidate 的 value
+- 未选动作：
+  - 额外做 counterfactual Monte Carlo 采样
+  - `answer` 会额外采样若干个 counterfactual answer batch
+  - 每个 batch 先对组内 candidates 的 value 取均值
+  - 再对这些 batch 均值取平均
+  - `comment` 同理，也是先对每个 comment batch 的 candidates 取均值，再对多个 batch 均值取平均
+  - 因此 comment 的反事实估计本质上是“均值的均值”
+  - 其中 comment 单个 candidate 的 value 本身又是“该 comment 下 next answer reward 的 Monte Carlo 均值减去 silent 基线”
+- `silent` 固定使用 `0`
 - regret 由 `action_value(other) - action_value(chosen)` 形成
 
-对应更新逻辑见 [run_all.py](run_all.py#L2204)。
+当前中层的动作采样也直接使用 raw regret-matching 策略，不再对 `search` 状态施加额外的动作概率约束。
+
+对应更新逻辑见 [run_all.py](run_all.py#L1982)。
 
 ### 6.5 外层调度器的价值
 
 外层每个 agent 的价值定义为：
 
-`本轮结束后最近 answer 的 r`
+`V_outer(i, s) = Σ_a π_middle(a | i, s) · Q_middle(i, a, s)`
 
-所以：
+也就是：
 
-- 若本轮选该 agent 后最终没有接受新答案，则价值通常回到 incumbent 的 `r`
-- 若接受了更好的 answer，则价值提高
+- 先估计该 agent 在当前状态下的中层三动作 value
+- 再按这个 agent 当前的中层策略概率，对 `silent / comment / answer` 做加权平均
+- 已选中的 agent 也使用同一口径
+- 其中被真实选中的中层动作仍复用这轮真实轨迹里的单个 realized value
+- 未被真实选中的中层动作则使用上面 6.4 的 counterfactual Monte Carlo 均值
 
-实现见 [run_all.py](run_all.py#L1735) 和 [run_all.py](run_all.py#L2204)。
+因此外层比较的是：
+
+- “如果当前 phase 下换另一个 agent 出场，它在自己当前中层策略下的期望动作价值是多少”
+
+而不再直接比较“本轮结束后 incumbent answer 的 reward”。
+
+实现见 [run_all.py](run_all.py#L1513) 和 [run_all.py](run_all.py#L1982)。
 
 ## 7. 代码结构
 
@@ -454,7 +497,7 @@ python run_staged_isolated.py --sample-counts 5 --experiments single_llm dual_gs
 ## 14. 运行注意事项
 
 1. 当前代码依赖 `modelscope`。如果环境缺少该包，`run_all.py` 无法正常 import。
-2. verifier 依赖本地 embedding 模型路径；如果本地模型不存在，verifier 初始化会失败。
+2. verifier 默认优先复用项目目录下的本地 embedding 缓存；如果本地缓存不存在，会回退到 `MAS_VERIFIER_EMBED_MODEL`（默认 `gpt2`）并下载到项目缓存目录。
 3. 第一次加载模型和数据时，缓存目录会明显增大，因此不建议把 `data/`、`models/`、`runs/` 直接提交到 Git。
 4. `run_staged_suite.py` 和 `run_staged_isolated.py` 默认是小样本 smoke / staging 工具，不等同于最终正式实验。
 5. 由于存在在线训练和采样，实验结果会对随机性、GPU 环境和模型缓存状态敏感。

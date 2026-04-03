@@ -48,6 +48,10 @@ GSPO_TRAIN_LAST_N_LAYERS = 2       # 除lm_head外，再解冻最后N层decoder 
 GSPO_TRAIN_DTYPE = "bfloat16"
 # 评论/协作轮奖励使用更多次下一轮解答取平均，进一步降低高方差。
 GSPO_COMMENT_EVAL_SAMPLES = 4
+# 中层对“未被真实选中的动作”做反事实估计时，
+# 额外重复采样多少个 candidate batch 再取均值。
+# 已选动作仍然只使用真实轨迹里那一个 value，不做这里的多批平均。
+MIDDLE_CF_NUM_BATCHES = 2
 # 如果一组候选奖励几乎完全一样，说明这次更新没有足够区分信号，直接跳过更稳。
 GSPO_SKIP_ZERO_SIGNAL_UPDATE = True
 GSPO_MIN_REWARD_STD = 0.05
@@ -94,7 +98,19 @@ VERIFIER_ACCEPT_SKIP_ZERO_DELTA = True
 VERIFIER_ACCEPT_ZERO_DELTA_EPS = 1e-6
 # 先保留这个配置名以兼容旧代码/旧实验记录，但当前版本不再使用 gray margin。
 VERIFIER_MARGIN = 0.05
-VERIFIER_EMBED_MODEL_PATH = os.path.join(EXPERIMENT_ROOT, "models", "AI-ModelScope", "gpt2")
+# verifier embedding 优先复用项目目录下的本地缓存；
+# fresh clone 若该目录为空，则回退到远端模型 ID 自动下载到 MODEL_CACHE。
+DEFAULT_VERIFIER_EMBED_MODEL_PATH = os.path.join(
+    EXPERIMENT_ROOT,
+    "models",
+    "AI-ModelScope",
+    "gpt2",
+)
+VERIFIER_EMBED_MODEL_PATH = os.environ.get(
+    "MAS_VERIFIER_EMBED_MODEL_PATH",
+    DEFAULT_VERIFIER_EMBED_MODEL_PATH,
+)
+VERIFIER_EMBED_MODEL_ID = os.environ.get("MAS_VERIFIER_EMBED_MODEL", "gpt2")
 VERIFIER_MAX_LENGTH = 256
 VERIFIER_CACHE_SIZE = 256
 # 兼容旧代码保留；单 scorer 版本的 keep 更新直接拟合 incumbent reward，
