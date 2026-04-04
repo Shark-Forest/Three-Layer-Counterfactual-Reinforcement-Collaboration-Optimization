@@ -89,7 +89,10 @@
 - 算法：`CFR / regret matching`
 - 当前直接使用 raw regret-matching：
   - 正遗憾归一化为当前策略
-  - 若所有正遗憾都为 `0`，则在允许动作上均匀分布
+  - 若所有正遗憾都为 `0`，则使用状态相关初始化分布
+  - `search`：`comment = 1/2`，`answer = 1/2`，`silent = 0`
+  - `stabilize`：`comment = 1/3`，`answer = 1/3`，`silent = 1/3`
+  - 无沉默实验会根据动作 mask 自动把初始化分布重新归一化到 `comment / answer`
   - 不再额外施加 `search` 状态下的中层动作概率约束
 - 在不启用外层调度器的实验里：
   - 仍然保留多个 agent bundle
@@ -127,28 +130,29 @@
 当前规则已经统一成训练/验证/测试一致：
 
 1. `pi1` 先采样一批 answer 候选。
-2. 如果这一批里存在可解析数字答案，只在这些可解析候选里选择 `verifier` 分数最高的那个。
-3. 如果整批都不可解析，则退回到全候选里选择 `verifier` 分数最高的那个。
-4. 选中的 `selected_text` 再交给 verifier 判断是否允许接管当前 incumbent。
+2. 训练阶段，这一批 candidates 会展开成多条真实训练分支。
+3. 验证/测试阶段，真实轨迹继续使用该 batch 的 `selected_text`。
+4. 当前实现里 `selected_idx` 默认就是第一个候选。
+5. answer 一旦被执行，就直接更新 latest answer；后续 comment / silent 轮次只把它当作 fallback 沿用。
 
 这意味着：
 
-- 训练轨迹和推理轨迹共用同一套选答逻辑。
-- `train` 与 `val/test` 的差别只在于是否做参数更新，而不在于真实轨迹如何选 answer。
+- 内层 GSPO 始终使用整批 candidates 更新。
+- `train` 时，中层/外层也把这批 candidates 展开成多条真实训练分支。
+- `val/test` 时，不展开多分支，只沿 `selected_text` 做单路径评估。
 
-## 6. verifier 设置
+## 6. phase 与 latest answer
 
-- verifier 使用单 scorer 结构。
-- `keep_prob = scorer(question, incumbent_answer)`
-- `accept_prob = scorer(question, candidate_answer)`
-- 接管条件：`accept_prob > keep_prob`
-- verifier 不直接看 comment，只看题目和 answer utterance。
+- 第 1 轮固定 `phase = search`。
+- 从第 2 轮开始，若上一轮该真实分支自己的单个 realized middle value 大于 `PHASE_Q_EPS`，则本轮 `phase = search`。
+- 否则本轮 `phase = stabilize`。
+- 当前默认 `PHASE_Q_EPS = 0.05`。
+- `incumbent` 变量现在只表示 latest answer，不再表示 verifier 审批后的 incumbent。
 
-### 6.1 verifier embedding 来源
+### 6.1 旧 verifier 代码
 
-- 优先使用项目目录下的本地缓存。
-- 如果本地缓存不存在，则回退到 `MAS_VERIFIER_EMBED_MODEL` 指定的模型。
-- 当前默认回退模型：`gpt2`
+- 仓库中仍保留 `src/verifier.py` 和对应配置，便于回溯旧实验。
+- 但 `run_all.py` 当前默认 8 组实验不会实例化或更新 verifier。
 
 ## 7. 奖励定义
 
@@ -183,7 +187,7 @@
 ### 7.5 中层反事实估计
 
 - 已选动作：
-  - 直接使用真实轨迹里被选中的那个 candidate 的单个 value
+  - 对每条真实训练分支，使用这条分支自己对应的单个 realized value
 - 未选动作：
   - 额外做 counterfactual Monte Carlo 采样
   - `answer`：采样 `1` 个 counterfactual answer batch，并对组内 candidates 的 value 取均值
@@ -193,6 +197,12 @@
   - 固定为 `0`
 - regret 更新：
   - 对每个备选动作计算 `action_value(other) - action_value(chosen)`
+
+补充：
+
+- 训练真实轨迹里，comment / answer 每轮都会先产生一个 batch，再展开成多条真实训练分支
+- 但反事实轨迹仍然只额外采样 `1` 个 counterfactual batch
+- 虚拟 comment 轨迹下只继续生成 `1` 个 answer，不再继续生成一个新的 answer batch
 
 ### 7.6 外层 agent value
 
@@ -217,18 +227,16 @@
 - `GSPO_USE_INDEPENDENT_MODEL = True`
 - `GSPO_TRAIN_LAST_N_LAYERS = 2`
 
-### 8.2 verifier
+### 8.2 phase / legacy verifier
 
-- `VERIFIER_LR = 0.1`
-- `VERIFIER_PHASE_THRESHOLD = 0.85`
-- `VERIFIER_STABILIZE_ALPHA = 0.10`
-- `VERIFIER_MAX_LENGTH = 256`
-- `VERIFIER_CACHE_SIZE = 256`
+- `PHASE_Q_EPS = 0.05`
+- `VERIFIER_*` 常量仍保留在 `src/config.py`，仅用于兼容旧实验记录/旧脚本
 
 ### 8.3 search 约束
 
 - `search / stabilize` phase 仍然保留，用于构造中层/外层状态
-- 但当前中层动作采样已退化为 raw regret-matching，不再额外使用旧的 search 概率 floor / cap 约束
+- phase 的切换只看上一轮该真实分支自己的单个 realized middle value，不再依赖 verifier
+- 当前中层动作采样已退化为 raw regret-matching，不再额外使用旧的 search 概率 floor / cap 约束
 - 相关旧配置仍保留在 `src/config.py`，便于回溯旧实验
 
 ## 9. 路径与缓存
@@ -310,10 +318,11 @@ timeout 120s conda run --no-capture-output -n lcs python -u run_staged_isolated.
 
 2. 函数级烟测
 
-- 已直接验证共享策略栈的 answer 选择逻辑：
-  - 若 batch 中存在可解析数字答案，只在可解析候选里选 `verifier` 分数最高者
-  - 若 batch 全部不可解析，则在全候选里选 `verifier` 分数最高者
-  - 选中的候选会正确写回 `selected_text` / `best_text`
+- 已直接验证共享策略栈的 answer 推进逻辑：
+  - 训练时真实 batch 会展开成多条训练分支
+  - 评估时真实轨迹默认使用该 batch 的 `selected_text`
+  - `selected_idx` 默认保持为 `0`
+  - answer 执行后会直接更新 latest answer
 
 当前限制：
 

@@ -63,6 +63,11 @@ CFR_NUM_ACTIONS = 3
 MIDDLE_ACTION_SILENT = 0
 MIDDLE_ACTION_COMMENT = 1
 MIDDLE_ACTION_ANSWER = 2
+# phase 切换规则：
+# - 第 1 轮固定 search
+# - 从第 2 轮开始，若上一轮该真实分支自己的单个 realized middle value > PHASE_Q_EPS，则继续 search
+# - 否则进入 stabilize
+PHASE_Q_EPS = 0.05
 NUM_AGENTS = 2           # 外层可调度的 agent 数
 # 三层策略逐轮调试打印：
 # - True:  每一轮打印 act / pred / reward / CFR 概率，便于排查 R3/R4/R5 为什么变化
@@ -80,11 +85,11 @@ REWARD_MISSING_PENALTY = -0.2
 # - 若已有 incumbent，则在 delta 口径下记为 0，在 absolute 口径下回退到 incumbent reward
 ROLLOUT_NO_ANSWER_PENALTY = -1.0
 
-# 三层策略里 verifier 的在线更新超参。
-# 当前 verifier 已重构成“单 scorer 头”：
-# - keep_prob: scorer(question, incumbent_utterance)
-# - accept_prob: scorer(question, candidate_utterance)
-# phase 看 keep_prob 是否足够高，accept 看 accept_prob 是否高于 keep_prob。
+# 下面这组 verifier 配置保留为历史兼容项。
+# 当前默认 8 组实验中，共享策略栈已不再使用 verifier；
+# 这里保留常量主要是为了：
+# - 兼容旧实验记录
+# - 兼容仍可能单独引用 src/verifier.py 的旧脚本
 VERIFIER_LR = 0.1
 # 这些 accept-specific 阈值保留名字仅为兼容旧日志/旧实验脚本；
 # 单 scorer 版本下，真正的 accept 边界由 keep_prob 本身给出，不再使用这些值。

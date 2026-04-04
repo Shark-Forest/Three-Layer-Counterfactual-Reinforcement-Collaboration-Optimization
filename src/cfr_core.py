@@ -15,9 +15,10 @@ class CFRBehaviorSelector:
     - 用反事实 action value 更新遗憾
     """
 
-    def __init__(self, num_actions: int, default_action: int = 0):
+    def __init__(self, num_actions: int, default_action: int = 0, fallback_strategy_fn=None):
         self.num_actions = num_actions
         self.default_action = default_action
+        self.fallback_strategy_fn = fallback_strategy_fn
         self.regret_sum_by_state = {}
         self.strategy_sum_by_state = {}
         self.iter_by_state = {}
@@ -55,6 +56,23 @@ class CFRBehaviorSelector:
         total = pos_regret.sum()
         if total > 0:
             return pos_regret / total
+
+        fallback = None
+        if self.fallback_strategy_fn is not None:
+            fallback = self.fallback_strategy_fn(
+                state_key=key,
+                allowed_actions=allowed_actions,
+                num_actions=self.num_actions,
+                default_action=self.default_action,
+            )
+            if fallback is not None:
+                fallback = np.asarray(fallback, dtype=np.float64)
+                if fallback.shape != (self.num_actions,):
+                    raise ValueError("fallback_strategy_fn 返回的策略维度不正确。")
+                fallback = np.maximum(fallback, 0.0) * mask
+                total = fallback.sum()
+                if total > 0:
+                    return fallback / total
 
         fallback = np.zeros(self.num_actions, dtype=np.float64)
         if mask.any():

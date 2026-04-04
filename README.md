@@ -1,6 +1,6 @@
 # Three-Level MAS Experiment on GSM8K
 
-本项目实现了一个面向 GSM8K 数学题的多智能体实验框架，用于比较从单模型基线到三层策略栈的 8 组实验设置，并分析在多轮交互中，`comment / answer / silence` 行为、外层调度器、在线 verifier、以及内层 GSPO 更新之间的作用关系。
+本项目实现了一个面向 GSM8K 数学题的多智能体实验框架，用于比较从单模型基线到三层策略栈的 8 组实验设置，并分析在多轮交互中，`comment / answer / silence` 行为、外层调度器、phase 状态机、以及内层 GSPO 更新之间的作用关系。
 
 当前代码以 `three_level_experiment` 目录作为实验根目录。模型缓存、数据缓存、日志、图表和 staged 运行输出都默认落在该目录下，便于独立打包成一个 Git 仓库。
 
@@ -11,7 +11,7 @@
 1. 多轮交互是否能逐步改善当前答案。
 2. 不同行为类型是否应该被区别对待。
 3. 哪一层负责“选谁来发言”、哪一层负责“发什么类型的话”、哪一层负责“把这句话说好”。
-4. 在存在 verifier 的前提下，如何同时训练外层调度、中层动作策略和内层文本策略。
+4. 如何同时训练外层调度、中层动作策略和内层文本策略，并保持训练与推理的一致性。
 
 ## 2. 八组实验
 
@@ -51,7 +51,7 @@
    - 外层：调度哪个 agent
    - 中层：选 `silent / comment / answer`
    - 内层：生成 comment 或 answer 文本
-   同时使用 verifier 决定 phase 和 answer 接管。
+   `phase` 由上一轮该真实分支自己的单个 realized middle value 决定，answer 直接更新 latest answer。
 
 8. `全量策略（中层无沉默）`
    与 `全量策略` 相同，但中层动作空间中移除 `silent`，只允许：
@@ -70,6 +70,12 @@
 - 状态来源：`phase`
 - 动作空间：agent 索引
 - 仅在 `全量策略` 中启用
+
+当前 `phase` 规则很简单：
+
+- 第 1 轮固定 `search`
+- 从第 2 轮开始，若上一轮该真实分支自己的单个 realized middle value 大于 `0.05`，则继续 `search`
+- 否则进入 `stabilize`
 
 在 `中间层策略+GSPO` 和 `中间层策略+GSPO（无沉默）` 中，这一层被移除；
 但系统仍保留多个 agent bundle，并按轮次做 round-robin 轮询，而不是固定只用一个 bundle。
@@ -94,7 +100,10 @@
 
 - 每个状态维护 `silent / comment / answer` 的累计遗憾
 - 采样时直接按“正遗憾归一化”得到当前策略
-- 如果所有正遗憾都为 0，则在允许动作上均匀采样
+- 如果所有正遗憾都为 0，则使用状态相关初始化分布：
+  - `search`：`comment = 1/2`，`answer = 1/2`，`silent = 0`
+  - `stabilize`：`comment = 1/3`，`answer = 1/3`，`silent = 1/3`
+- 对无沉默实验，动作 mask 会自动把上面的初始化分布重新归一化到 `comment / answer`
 - 不再额外施加 `search` 状态下的概率 floor / cap 约束
 
 另外还有两组“无沉默”消融：
@@ -117,38 +126,36 @@
 `pi1(answer)` 进入真实轨迹的规则现在统一为：
 
 - 先采样一批 answer 候选
-- 如果其中存在可解析数字答案，只在这些可解析候选里选择 `verifier` 分数最高的那个
-- 如果整批都不可解析，则退回到全候选里选择 `verifier` 分数最高的那个
+- 训练时，这一批 candidates 会展开成多条真实训练分支
+- 验证/测试时，真实轨迹继续使用该 batch 的 `selected_text`
+- 当前实现里 `selected_idx` 默认就是第一个候选
 
-也就是说，这几条共享策略栈实验里，训练、验证、测试都使用同一套“真实轨迹选答”机制，避免训练/推理不一致。
+也就是说，这几条共享策略栈实验里：
 
-`单LLM GSPO` 和 `双LLM GSPO轮询` 不带 verifier 候选重排，仍默认使用该次采样 batch 的第一个候选推进真实轨迹。
+- 内层 GSPO 一直用整批 candidates 更新
+- 训练阶段的中层/外层也会把这批 candidates 展开成多条真实训练分支
+- 验证/测试阶段仍保留单分支真实轨迹，用于可控评估
 
-## 4. verifier 的作用
+`单LLM GSPO` 和 `双LLM GSPO轮询` 也默认使用该次采样 batch 的第一个候选推进真实轨迹。
 
-verifier 实现在 [src/verifier.py](src/verifier.py)。
+## 4. phase 与 latest answer
 
-当前版本是一个轻量在线 verifier：
+当前默认实验不再使用 verifier。
 
-- backbone：本地 embedding 模型
-- head：一个线性 scorer
+共享策略栈里和“状态切换 / 答案保留”相关的规则现在是：
 
-它承担两个职责：
+1. `phase`
+   - 第 1 轮固定为 `search`
+   - 从第 2 轮开始，看上一轮该真实分支自己的单个 realized middle value
+   - 若该值大于 `0.05`，则本轮继续 `search`
+   - 否则本轮为 `stabilize`
 
-1. 决定外层状态 `phase`
-   - `search`
-   - `stabilize`
+2. `latest_answer`
+   - 旧代码里的 `incumbent` 变量现在只表示“最近一次 answer 的文本/数值”
+   - 它不再是经过 verifier 审批后保留下来的 incumbent
+   - 它只在后续 comment / silent 轮次中作为 fallback 被沿用
 
-2. 在共享策略栈实验中，为 answer 候选提供打分，并决定被选中的 answer 是否可以接管当前 incumbent
-
-当前逻辑下：
-
-- `keep_prob = scorer(question, incumbent_answer)`
-- `accept_prob = scorer(question, candidate_answer)`
-- 真实轨迹里先按 `accept_prob` 选择候选 answer
-- 如果 `accept_prob > keep_prob`，则候选答案允许接管 incumbent
-
-也就是说，verifier 不直接看 comment，而是只看“题目 + 答案 utterance 本身”。
+仓库里仍保留 [src/verifier.py](src/verifier.py) 作为旧实验兼容代码，但 `run_all.py` 当前默认 8 组实验不会实例化或更新它。
 
 ## 5. 八组实验的训练与评估流程
 
@@ -179,7 +186,11 @@ GSM8K 现在统一采用：
 2. `val` 上只验证，不更新
 3. `test` 上最终评估
 
-其中，共享策略栈路径在 `train / val / test` 三个阶段都共用同一套 answer 进入真实轨迹的选择规则；差别只在于 `train` 会额外做 CFR / GSPO / verifier 参数更新，而 `val / test` 不更新。
+其中，共享策略栈路径在 `train / val / test` 三个阶段都共用同一套 batch 采样与 value 定义；差别在于：
+
+- `train` 会把真实 batch 展开成多条训练分支，并更新 CFR / GSPO
+- `val / test` 不更新参数，也不展开多分支，只沿 `selected_text` 单路径评估
+- 三个阶段的 `phase` 都使用“上一轮该真实分支自己的单个 realized middle value”
 
 ### 5.3 哪些实验只做测试
 
@@ -269,7 +280,7 @@ GSM8K 现在统一采用：
 中层三动作的反事实比较使用上述 value：
 
 - 已选动作：
-  - 使用这轮真实采样里真正被选中的那个 candidate 的 value
+  - 对每一条真实训练分支，使用这条分支自己对应的单个 realized value
 - 未选动作：
   - 额外做 counterfactual Monte Carlo 采样
   - `answer`：采样 1 个 counterfactual answer batch，并对组内 candidates 的 value 取均值
@@ -280,7 +291,8 @@ GSM8K 现在统一采用：
 
 因此当前实现里：
 
-- 真实轨迹：comment / answer 仍然各自产生一组 candidates
+- 训练真实轨迹：comment / answer 每轮都会先产生一组 candidates，再展开成多条真实训练分支
+- 验证/测试真实轨迹：仍然只沿 `selected_text` 保留单分支
 - 虚拟 rollout：每条 comment 轨迹只继续产生 1 个 answer
 - 反事实动作价值：只采样 1 个 counterfactual batch，不再做 batch 均值外再套一层 batch 均值
 
@@ -329,7 +341,7 @@ three_level_experiment/
 │   ├── model_loader.py
 │   ├── gspo_verl.py
 │   ├── cfr_core.py
-│   ├── verifier.py
+│   ├── verifier.py      # 旧实验兼容代码，默认主流程未使用
 │   ├── metrics_logger.py
 │   └── plotter.py
 ├── data/      # 数据缓存，默认忽略
@@ -357,7 +369,8 @@ three_level_experiment/
   - 生成参数
   - GSPO 超参数
   - CFR 超参数
-  - verifier 超参数
+  - phase epsilon
+  - 以及保留的旧 verifier 超参数
   - 缓存目录和输出目录
 
 ## 8. 环境依赖
@@ -508,7 +521,7 @@ python run_staged_isolated.py --sample-counts 5 --experiments single_llm dual_gs
 ## 14. 运行注意事项
 
 1. 当前代码依赖 `modelscope`。如果环境缺少该包，`run_all.py` 无法正常 import。
-2. verifier 默认优先复用项目目录下的本地 embedding 缓存；如果本地缓存不存在，会回退到 `MAS_VERIFIER_EMBED_MODEL`（默认 `gpt2`）并下载到项目缓存目录。
+2. 默认 `run_all.py` 主流程已经不依赖 verifier embedding 缓存；只有你手动调用旧的 `src/verifier.py` 路径时，才会用到相关 verifier 模型配置。
 3. 第一次加载模型和数据时，缓存目录会明显增大，因此不建议把 `data/`、`models/`、`runs/` 直接提交到 Git。
 4. `run_staged_suite.py` 和 `run_staged_isolated.py` 默认是小样本 smoke / staging 工具，不等同于最终正式实验。
 5. 由于存在在线训练和采样，实验结果会对随机性、GPU 环境和模型缓存状态敏感。
@@ -560,5 +573,6 @@ git push -u origin main
 
 - 外层和中层用 CFR 学策略
 - 内层用 GSPO 学文本
-- verifier 负责状态判断和答案接管
+- `phase` 由上一轮该真实分支自己的单个 realized middle value 决定
+- `latest_answer` 只负责在 comment / silent 轮次下做兜底
 - 现在统一支持 8 组实验、`train/val/test` 流程，以及针对 `comment / answer / silent` 的显式价值定义

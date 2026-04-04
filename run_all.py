@@ -14,7 +14,6 @@ from src.data_loader import load_gsm8k_motac, load_gsm8k_splits, compute_accurac
 from src.model_loader import generate_response, get_gpt2
 from src.gspo_verl import GSPOAgentPolicy
 from src.cfr_core import CFRBehaviorSelector
-from src.verifier import OnlineAnswerVerifier
 from src.metrics_logger import (
     init_logs,
     log_single,
@@ -83,7 +82,7 @@ def cleanup_cuda_memory(clear_cuda_cache=True):
     if clear_cuda_cache and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-def teardown_three_layer_runtime(agents, outer_cfr, middle_cfr, verifier):
+def teardown_three_layer_runtime(agents, outer_cfr, middle_cfr):
     """
     三层实验的保守收尾路径。
 
@@ -113,7 +112,6 @@ def teardown_three_layer_runtime(agents, outer_cfr, middle_cfr, verifier):
     agents = None
     outer_cfr = None
     middle_cfr = None
-    verifier = None
     print("[三层teardown] drop_refs done", flush=True)
 
     print("[三层teardown] gc_only_cleanup start", flush=True)
@@ -121,7 +119,7 @@ def teardown_three_layer_runtime(agents, outer_cfr, middle_cfr, verifier):
     print("[三层teardown] gc_only_cleanup done", flush=True)
     print("[三层teardown] finished", flush=True)
 
-    return agents, outer_cfr, middle_cfr, verifier
+    return agents, outer_cfr, middle_cfr
 
 def is_exact_match(pred_num, gt):
     """
@@ -397,36 +395,24 @@ def rollout_terminal_delta_reward(pred_num, incumbent_pred, gt):
         return ROLLOUT_NO_ANSWER_PENALTY
     return reward_delta_from_preds(incumbent_pred, pred_num, gt)
 
-def is_late_round(rnd):
-    """
-    进入后期轮次后，系统应当更偏向 stabilize。
-
-    当前定义：
-    - 当回合位置达到总轮数的 80% 及以后，认为进入 late stage
-    - 5 轮实验里对应第 4、5 轮
-    """
-    return (rnd / max(NUM_ROUNDS, 1)) >= 0.8
-
-def compute_phase(verifier, question, history, incumbent_text, rnd):
+def compute_phase(prev_phase_value, rnd, eps=PHASE_Q_EPS):
     """
     把外层状态压缩成两个 phase：
     - search
     - stabilize
 
-    这里不再使用启发式关键词，也不再把状态切得很碎。
-    phase 只由两部分决定：
-    1. verifier scorer 对当前 incumbent 的绝对打分
-    2. 当前是否已经进入后期轮次
+    当前规则：
+    - 第 1 轮固定为 search
+    - 从第 2 轮开始，看上一轮该真实分支自己的单个 realized middle value
+    - 若该值 > eps，则继续 search
+    - 否则进入 stabilize
     """
-    keep_prob, _ = verifier.predict_keep_prob(
-        question,
-        history,
-        incumbent_text,
-    )
-    late_flag = 1.0 if is_late_round(rnd) else 0.0
-    stability_score = keep_prob + VERIFIER_STABILIZE_ALPHA * late_flag
-    phase = "stabilize" if stability_score >= VERIFIER_PHASE_THRESHOLD else "search"
-    return phase, keep_prob, stability_score
+    if rnd <= 1:
+        return "search", 0.0
+
+    phase_score = float(prev_phase_value)
+    phase = "search" if phase_score > eps else "stabilize"
+    return phase, phase_score
 
 def build_outer_state(phase):
     return (
@@ -440,6 +426,35 @@ def build_middle_state(selected_agent, phase):
         f"agent={selected_agent}",
         f"phase={phase}",
     )
+
+def build_middle_fallback_strategy(state_key, allowed_actions, num_actions, default_action):
+    """
+    中层策略的初始化分布。
+
+    只在该 state 下所有正遗憾都为 0 时生效：
+    - search: answer / comment 各 1/2，silent 为 0
+    - stabilize: answer / comment / silent 各 1/3
+
+    无沉默实验会通过 allowed_actions 的 mask 自动退化成：
+    - search: answer / comment 各 1/2
+    - stabilize: answer / comment 各 1/2
+    """
+    phase = "stabilize"
+    if isinstance(state_key, (list, tuple)):
+        for item in state_key:
+            if isinstance(item, str) and item.startswith("phase="):
+                phase = item.split("=", 1)[1]
+                break
+
+    fallback = np.zeros(num_actions, dtype=np.float64)
+    if phase == "search":
+        fallback[MIDDLE_ACTION_COMMENT] = 0.5
+        fallback[MIDDLE_ACTION_ANSWER] = 0.5
+    else:
+        fallback[MIDDLE_ACTION_SILENT] = 1.0 / 3.0
+        fallback[MIDDLE_ACTION_COMMENT] = 1.0 / 3.0
+        fallback[MIDDLE_ACTION_ANSWER] = 1.0 / 3.0
+    return fallback
 
 def get_middle_allowed_actions(rnd, incumbent_pred, allow_silent=True):
     """
@@ -475,94 +490,6 @@ def set_sampled_batch_selected_candidate(agent, batch, selected_idx):
         agent.last_update["selected_text"] = batch["selected_text"]
         agent.last_update["best_text"] = batch["selected_text"]
     return selected_idx
-
-def select_answer_candidate_index(
-    verifier,
-    question,
-    history,
-    incumbent_text,
-    incumbent_pred,
-    batch,
-):
-    """
-    在同一批候选里选择“进入真实轨迹”的 answer。
-
-    当前统一规则只保留一个主准则：
-    - 选择 verifier 分数最高的候选
-
-    但为了避免把明显“不像最终答案”的文本直接送入 answer 轨迹，
-    这里仍保留一个最弱约束：
-    - 如果这一批里存在可解析数字答案，则只在可解析候选里比 verifier 分数
-    - 只有当整批都不可解析时，才退回到全候选里比 verifier 分数
-
-    这样训练和推理都会走同一套简单规则，不再混入：
-    - 共识数 bonus
-    - keep bonus / change penalty
-    - 复合 tie-break 逻辑
-    """
-    candidates = batch["candidates"]
-    if not candidates:
-        return 0, None
-
-    parseable_mask = [
-        extract_pred_num(cand["text"]) is not None
-        for cand in candidates
-    ]
-    require_parseable = any(parseable_mask)
-    best_idx = 0
-    best_meta = None
-    accept_gate = verifier.get_accept_gate(question, history, incumbent_text)
-    accept_barrier = accept_gate["barrier"]
-    gate_keep_prob = accept_gate["keep_prob"]
-
-    for idx, cand in enumerate(candidates):
-        candidate_pred = extract_pred_num(cand["text"])
-        parseable = candidate_pred is not None
-        if require_parseable and not parseable:
-            continue
-
-        accept_prob, _ = verifier.predict_accept_prob(
-            question,
-            history,
-            incumbent_text,
-            cand["text"],
-        )
-        accept_margin = accept_prob - accept_barrier
-
-        score = (
-            accept_prob,
-            -idx,
-        )
-        if best_meta is None or score > best_meta["score"]:
-            best_idx = idx
-            best_meta = {
-                "score": score,
-                "candidate_pred": candidate_pred,
-                "parseable_only_pool": require_parseable,
-                "accept_prob": accept_prob,
-                "accept_margin": accept_margin,
-                "accept_barrier": accept_barrier,
-                "gate_keep_prob": gate_keep_prob,
-                "keep_bonus": 0.0,
-                "change_penalty": 0.0,
-            }
-
-    if best_meta is None:
-        return 0, None
-    return best_idx, best_meta
-
-def maybe_print_answer_candidate_selection_debug(sample_idx, rnd, batch, selected_idx, meta):
-    if not THREE_LAYER_DEBUG_PRINT or meta is None:
-        return
-
-    selected_pred_str = "None" if meta["candidate_pred"] is None else f"{meta['candidate_pred']:.4f}"
-    print(
-        f"[候选选择] sample={sample_idx} rnd={rnd} selected_idx={selected_idx} "
-        f"selected_pred={selected_pred_str} parseable_only_pool={int(meta['parseable_only_pool'])} "
-        f"accept_prob={meta['accept_prob']:.4f} accept_margin={meta['accept_margin']:.4f} "
-        f"accept_barrier={meta['accept_barrier']:.4f} gate_keep_prob={meta['gate_keep_prob']:.4f} "
-        f"keep_bonus={meta['keep_bonus']:.4f} change_penalty={meta['change_penalty']:.4f}"
-    )
 
 def classify_round_transition(previous_pred, current_pred, gt):
     previous_reward = reward_from_pred(previous_pred, gt)
@@ -641,7 +568,6 @@ def get_constrained_middle_strategy(
     rnd,
     selected_agent,
     incumbent_pred,
-    keep_prob,
     allow_silent=True,
     allowed_actions=None,
 ):
@@ -663,7 +589,6 @@ def choose_middle_action(
     rnd,
     selected_agent,
     incumbent_pred,
-    keep_prob,
     allow_silent=True,
 ):
     state, allowed_actions, strategy = get_constrained_middle_strategy(
@@ -672,7 +597,6 @@ def choose_middle_action(
         rnd,
         selected_agent,
         incumbent_pred,
-        keep_prob,
         allow_silent=allow_silent,
     )
     act = int(np.random.choice(CFR_NUM_ACTIONS, p=strategy))
@@ -682,8 +606,7 @@ def maybe_print_three_layer_round_debug(
     sample_idx,
     rnd,
     phase,
-    keep_prob,
-    stability_score,
+    phase_score,
     selected_agent,
     act,
     candidate_pred,
@@ -692,13 +615,6 @@ def maybe_print_three_layer_round_debug(
     realized_value,
     outer_strategy,
     middle_strategy,
-    accepted,
-    verifier_prob,
-    accept_threshold,
-    accept_keep_prob,
-    accept_barrier,
-    accept_margin,
-    accept_reason,
 ):
     """
     三层策略的逐轮调试打印。
@@ -711,7 +627,7 @@ def maybe_print_three_layer_round_debug(
     - act: pi2 / pi0 / pi1
     - candidate_pred: 本轮答案候选里提取出的数字
     - incumbent_pred: 本轮结束后系统保留的 incumbent
-    - accepted: verifier 是否允许本轮候选覆盖 incumbent
+    - phase_score: 上一轮实际执行动作的 value，用于决定本轮 search / stabilize
     """
     if not THREE_LAYER_DEBUG_PRINT:
         return
@@ -723,13 +639,10 @@ def maybe_print_three_layer_round_debug(
     middle_strategy_str = ", ".join(f"{prob:.4f}" for prob in middle_strategy)
     print(
         f"[三层调试] sample={sample_idx} rnd={rnd} phase={phase} "
-        f"keep_prob={keep_prob:.4f} stability_score={stability_score:.4f} agent={selected_agent} "
+        f"phase_score={phase_score:.4f} agent={selected_agent} "
         f"act={get_three_layer_action_name(act)} candidate_pred={current_pred_str} "
         f"incumbent_pred={incumbent_pred_str} gt={gt:.4f} hit={int(hit)} "
-        f"realized_value={realized_value:.4f} accepted={int(accepted)} "
-        f"verifier_prob={verifier_prob:.4f} accept_threshold={accept_threshold:.4f} "
-        f"accept_keep_prob={accept_keep_prob:.4f} accept_barrier={accept_barrier:.4f} "
-        f"accept_margin={accept_margin:.4f} accept_reason={accept_reason} "
+        f"realized_value={realized_value:.4f} "
         f"outer=[{outer_strategy_str}] "
         f"middle=[{middle_strategy_str}]"
     )
@@ -739,53 +652,6 @@ def maybe_print_three_layer_stage(sample_idx, rnd, stage, start_time):
         return
     elapsed = time.perf_counter() - start_time
     print(f"[三层阶段] sample={sample_idx} rnd={rnd} stage={stage} elapsed={elapsed:.2f}s")
-
-def maybe_print_accept_training_debug(
-    sample_idx,
-    rnd,
-    previous_pred,
-    candidate_pred,
-    accepted,
-    update_stats,
-):
-    if not THREE_LAYER_DEBUG_PRINT or update_stats is None:
-        return
-
-    previous_pred_str = "None" if previous_pred is None else f"{previous_pred:.4f}"
-    candidate_pred_str = "None" if candidate_pred is None else f"{candidate_pred:.4f}"
-    batch_summary = (
-        f"batch_parseable={update_stats['num_parseable']} supervised={update_stats['num_supervised']} "
-        f"pos={update_stats['num_positive']} neg={update_stats['num_negative']} zero={update_stats['num_zero']} "
-        f"margin_step_l2={update_stats['margin_step_l2']:.6f} "
-        f"pairwise_pairs={update_stats['pairwise_num_pairs']} "
-        f"pairwise_violations={update_stats['pairwise_num_violations']} "
-        f"pairwise_step_l2={update_stats['pairwise_step_l2']:.6f}"
-    )
-    selected_stats = update_stats.get("selected")
-    if selected_stats is None:
-        print(
-            f"[accept训练] sample={sample_idx} rnd={rnd} prev_pred={previous_pred_str} "
-            f"candidate_pred={candidate_pred_str} accepted={int(accepted)} "
-            f"selected=none {batch_summary}"
-        )
-        return
-
-    print(
-        f"[accept训练] sample={sample_idx} rnd={rnd} prev_pred={previous_pred_str} "
-        f"candidate_pred={candidate_pred_str} accepted={int(accepted)} "
-        f"reward={selected_stats['reward']:.4f} "
-        f"delta_reward={selected_stats['delta_reward']:.4f} "
-        f"target_prob={selected_stats['target_prob']:.4f} "
-        f"target_margin={selected_stats['target_margin']:.4f} "
-        f"pre_prob={selected_stats['pre_prob']:.4f} post_prob={selected_stats['post_prob']:.4f} "
-        f"pre_logit={selected_stats['pre_logit']:.4f} post_logit={selected_stats['post_logit']:.4f} "
-        f"keep_prob={selected_stats['keep_prob']:.4f} accept_threshold={selected_stats['accept_threshold']:.4f} "
-        f"accept_barrier={selected_stats['accept_barrier']:.4f} "
-        f"post_keep_prob={selected_stats['post_keep_prob']:.4f} "
-        f"pre_margin={selected_stats['pre_margin']:.4f} post_margin={selected_stats['post_margin']:.4f} "
-        f"feature_norm={selected_stats['feature_norm']:.4f} "
-        f"step_l2={selected_stats['step_l2']:.6f} {batch_summary}"
-    )
 
 def print_three_layer_sample_monitor(
     sample_idx,
@@ -972,134 +838,8 @@ def get_three_layer_action_spec(act):
         return "pi0", PI0_PROMPT, "pi0", "comment"
     return "pi1", PI1_PROMPT, "pi1", "answer"
 
-def evaluate_answer_revision(
-    verifier,
-    question,
-    rnd,
-    history,
-    incumbent_text,
-    incumbent_pred,
-    candidate_text,
-    candidate_pred,
-    gt,
-):
-    """
-    评估一个候选答案相对 incumbent 的收益。
-
-    这里要分清两个“值”：
-    1. delta_reward
-       候选答案如果真的替换 incumbent，理论上会比 incumbent 好多少/差多少
-    2. effective_delta
-       这是环境里“实际生效”的收益
-       只有 verifier 点头接受，这次修订才真的改写 incumbent；
-       否则从环境视角看，这轮没有改答案，所以收益按 0 记
-
-    你可以把它理解成：
-    - delta_reward: 候选答案的客观好坏
-    - effective_delta: 候选答案在“经过 verifier 审批后”真正产生的效果
-
-    effective_delta:
-    - 如果 verifier 接受，就把相对 incumbent 的提升/下降计入环境回报
-    - 如果 verifier 拒绝，就视为本轮没有真正修改 incumbent，收益记 0
-    """
-    delta_reward = reward_delta_from_preds(incumbent_pred, candidate_pred, gt)
-    if (
-        incumbent_pred is not None
-        and candidate_pred is not None
-        and abs(candidate_pred - incumbent_pred) <= 1e-6
-    ):
-        gate = verifier.get_accept_gate(question, history, incumbent_text)
-        return {
-            "delta_reward": delta_reward,
-            "effective_delta": 0.0,
-            "accept": False,
-            "verifier_prob": 0.0,
-            "accept_threshold": gate["threshold"],
-            "accept_keep_prob": gate["keep_prob"],
-            "accept_barrier": gate["barrier"],
-            "accept_margin": -gate["barrier"],
-            "accept_reason": "same_pred",
-            "improved": False,
-        }
-
-    decision = verifier.should_accept(
-        question,
-        history,
-        incumbent_text,
-        candidate_text,
-        candidate_pred,
-    )
-    accept = decision["accept"]
-    effective_delta = delta_reward if accept else 0.0
-    return {
-        "delta_reward": delta_reward,
-        "effective_delta": effective_delta,
-        "accept": accept,
-        "verifier_prob": decision["accept_prob"],
-        "accept_threshold": decision["accept_threshold"],
-        "accept_keep_prob": decision["keep_prob"],
-        "accept_barrier": decision["accept_barrier"],
-        "accept_margin": decision["accept_margin"],
-        "accept_reason": decision["reason"],
-        "improved": delta_reward > 0.0,
-    }
-
-def build_accept_update_payload(
-    question,
-    history,
-    incumbent_text,
-    incumbent_pred,
-    incumbent_reward,
-    batch,
-    gt,
-):
-    """
-    为 accept_head 组装整批监督样本。
-
-    这里不只喂最终 selected candidate，
-    而是把这一轮真正采样出来的所有 parseable answer candidates 都送进 verifier：
-    - 点式监督：每个 candidate 相对 incumbent 是正收益还是负收益
-    - 排序监督：同一批里，更优 candidate 的分数应高于更差 candidate
-
-    这不会引入训练/推理不一致：
-    - 推理时仍只使用可观测信号选候选、再由 verifier 审批
-    - 训练时只是把“本轮已经实际采样到的 batch”利用得更充分
-    """
-    if incumbent_text is None or batch is None:
-        return None
-
-    candidate_updates = []
-    selected_idx = int(batch.get("selected_idx", -1))
-    for idx, cand in enumerate(batch.get("candidates", [])):
-        candidate_pred = extract_pred_num(cand["text"])
-        if candidate_pred is None:
-            continue
-        candidate_updates.append({
-            "current_text": cand["text"],
-            "candidate_pred": candidate_pred,
-            "reward": reward_from_pred(candidate_pred, gt),
-            "delta_reward": reward_delta_from_preds(incumbent_pred, candidate_pred, gt),
-            "selected": idx == selected_idx,
-        })
-
-    if not candidate_updates:
-        return None
-    return (
-        question,
-        history,
-        incumbent_text,
-        incumbent_reward,
-        candidate_updates,
-    )
-
 def compute_answer_candidate_rewards(
-    question,
     batch,
-    verifier,
-    rnd,
-    history,
-    incumbent_text,
-    incumbent_pred,
     gt,
 ):
     """
@@ -1193,7 +933,7 @@ def average_next_answer_delta_reward(
         num_samples,
     )
 
-def compute_comment_candidate_rewards(step, agent_bundle, verifier, incumbent_text, incumbent_pred, gt):
+def compute_comment_candidate_rewards(step, agent_bundle, incumbent_pred, gt):
     """
     给 comment policy 的候选 comment 打分。
 
@@ -1386,8 +1126,6 @@ def estimate_policy_stack_silent_value(
     rnd,
     incumbent_pred,
     gt,
-    strategy,
-    allowed_actions=None,
 ):
     """
     中层策略现在退化为最朴素的 regret matching。
@@ -1490,15 +1228,10 @@ def estimate_middle_action_values(
     question,
     gt,
     agents,
-    middle_cfr,
-    phase,
     selected_agent,
     rnd,
     history,
-    incumbent_text,
     incumbent_pred,
-    verifier,
-    keep_prob,
     allow_silent=True,
     known_action=None,
     known_value=None,
@@ -1568,8 +1301,6 @@ def estimate_middle_action_values(
                 rnd,
                 incumbent_pred,
                 gt,
-                None,
-                allowed_actions=allowed_actions,
             )
     return values, allowed_actions
 
@@ -1578,15 +1309,11 @@ def get_cached_middle_estimate(
     question,
     gt,
     agents,
-    middle_cfr,
     phase,
     agent_idx,
     rnd,
     history,
-    incumbent_text,
     incumbent_pred,
-    verifier,
-    keep_prob,
     allow_silent=True,
     known_action=None,
     known_value=None,
@@ -1611,15 +1338,10 @@ def get_cached_middle_estimate(
         question,
         gt,
         agents,
-        middle_cfr,
-        phase,
         agent_idx,
         rnd,
         history,
-        incumbent_text,
         incumbent_pred,
-        verifier,
-        keep_prob,
         allow_silent,
         known_action=known_action,
         known_value=known_value,
@@ -1666,9 +1388,10 @@ def init_three_layer_sample_state():
     - history:
       当前样本到目前为止的结构化对话历史
     - incumbent_text / incumbent_pred:
-      当前系统正式保留的答案文本和数字答案
-    - incumbent_reward:
-      当前 incumbent 对应的 reward，用于 keep_head 训练和 phase 判断
+      当前最新一次 answer 的文本和数字答案；如果后续轮次 comment/silent，
+      它只作为 latest_answer fallback 被沿用
+    - prev_phase_value:
+      上一轮该真实分支自己的单个 realized middle value，用于下一轮 phase 判断
     - best_correct:
       这条样本是否历史上曾经答对过，用来算 best-so-far
     - first_*:
@@ -1679,59 +1402,93 @@ def init_three_layer_sample_state():
         "incumbent_text": None,
         "incumbent_pred": None,
         "incumbent_reward": 0.0,
+        "prev_phase_value": 0.0,
         "best_correct": False,
         "first_improve_round": None,
         "first_degrade_round": None,
         "first_stalled_wrong_round": None,
     }
 
+def clone_branch_state_with_outcome(parent_state, outcome, gt, rnd):
+    transition = classify_round_transition(
+        parent_state["incumbent_pred"],
+        outcome["incumbent_pred"],
+        gt,
+    )
+    child_state = {
+        "history": outcome["history"],
+        "incumbent_text": outcome["incumbent_text"],
+        "incumbent_pred": outcome["incumbent_pred"],
+        "incumbent_reward": reward_from_pred(outcome["incumbent_pred"], gt),
+        "prev_phase_value": float(outcome["realized_value"]),
+        "best_correct": parent_state["best_correct"] or bool(
+            compute_accuracy([outcome["incumbent_pred"]], [gt])
+        ),
+        "first_improve_round": parent_state["first_improve_round"],
+        "first_degrade_round": parent_state["first_degrade_round"],
+        "first_stalled_wrong_round": parent_state["first_stalled_wrong_round"],
+    }
+    if transition["improved"] and child_state["first_improve_round"] is None:
+        child_state["first_improve_round"] = rnd
+    if transition["degraded"] and child_state["first_degrade_round"] is None:
+        child_state["first_degrade_round"] = rnd
+    if transition["stalled_wrong"] and child_state["first_stalled_wrong_round"] is None:
+        child_state["first_stalled_wrong_round"] = rnd
+    return child_state, transition
+
+def materialize_round_children(parent_state, round_result, gt, rnd, expand_all):
+    outcomes = round_result["candidate_outcomes"]
+    if not expand_all:
+        outcomes = outcomes[:1]
+
+    children = []
+    for outcome in outcomes:
+        child_state, transition = clone_branch_state_with_outcome(
+            parent_state,
+            outcome,
+            gt,
+            rnd,
+        )
+        children.append({
+            "state": child_state,
+            "transition": transition,
+            "outcome": outcome,
+        })
+    return children
+
 def run_three_layer_realized_action(
     agents,
-    verifier,
-    sample_idx,
     question,
     gt,
     rnd,
     selected_agent,
     act,
-    phase,
     pre_history,
     pre_incumbent_text,
     pre_incumbent_pred,
-    middle_strategy,
 ):
     """
     执行三层策略在“真实轨迹”里的这一步动作。
 
     这一步只做一件事：
     - 在已经确定了 `selected_agent` 和 `act` 之后，
-      真正去采样文本、算 reward、决定是否覆盖 incumbent。
+      真正去采样文本、算 reward，并在 answer 动作下直接更新 latest_answer。
 
     返回一个字典，里面把这一轮后续还会用到的所有中间结果都带出来：
     - history:
       这一轮执行完后的新历史
     - realized_value:
       中层 / 内层学习用的动作价值
-    - accept_update_payload:
-      给 accept_head 做在线更新时需要的监督信号
     - gspo_update_payload:
       给内层 GSPO policy 做更新时需要的缓存批次和 reward
 
     你可以把它理解成“把长主循环里最核心的那段 if/elif/else 单独搬出来”。
     """
     current_pred = None
-    accepted = False
-    has_answer_candidates = False
-    incumbent_changed = False
-    verifier_prob = 0.0
-    accept_threshold = 0.0
-    accept_keep_prob = 0.0
-    accept_barrier = VERIFIER_ACCEPT_THRESHOLD
-    accept_margin = -VERIFIER_ACCEPT_THRESHOLD
-    accept_reason = "not_answer"
     realized_middle_value = 0.0
+    candidate_middle_values = []
+    candidate_outcomes = []
     step = None
-    accept_update_payload = None
     gspo_update_payload = None
     history = pre_history
     incumbent_text = pre_incumbent_text
@@ -1747,7 +1504,6 @@ def run_three_layer_realized_action(
             rnd,
             pre_incumbent_pred,
             gt,
-            middle_strategy,
         )
         history = append_round_output(
             history,
@@ -1756,6 +1512,14 @@ def run_three_layer_realized_action(
             "pi2 选择不发言，本轮不修改 incumbent。",
             "silent",
         )
+        candidate_middle_values = [realized_middle_value]
+        candidate_outcomes = [{
+            "history": history,
+            "incumbent_text": incumbent_text,
+            "incumbent_pred": incumbent_pred,
+            "current_pred": None,
+            "realized_value": realized_middle_value,
+        }]
     elif act == MIDDLE_ACTION_COMMENT:
         silent_baseline = estimate_middle_silent_baseline(
             agents[selected_agent],
@@ -1786,6 +1550,7 @@ def run_three_layer_realized_action(
             step["batch"],
             comment_rewards,
         )
+        candidate_middle_values = [float(v) for v in comment_rewards]
         selected_idx = int(step["batch"].get("selected_idx", 0))
         if comment_rewards:
             selected_idx = max(0, min(selected_idx, len(comment_rewards) - 1))
@@ -1797,6 +1562,20 @@ def run_three_layer_realized_action(
             step["selected_text"],
             "comment",
         )
+        for cand, cand_value in zip(step["batch"]["candidates"], candidate_middle_values):
+            candidate_outcomes.append({
+                "history": append_round_output(
+                    pre_history,
+                    rnd,
+                    f"agent{selected_agent}_pi0",
+                    cand["text"],
+                    "comment",
+                ),
+                "incumbent_text": pre_incumbent_text,
+                "incumbent_pred": pre_incumbent_pred,
+                "current_pred": None,
+                "realized_value": cand_value,
+            })
     else:
         silent_baseline = estimate_middle_silent_baseline(
             agents[selected_agent],
@@ -1815,39 +1594,8 @@ def run_three_layer_realized_action(
             "answer",
             prompt_override=PI1_PROMPT,
         )
-        has_answer_candidates = bool(step["batch"]["candidates"])
-        selected_idx = 0
-        selected_meta = None
-        if has_answer_candidates:
-            selected_idx, selected_meta = select_answer_candidate_index(
-                verifier,
-                question,
-                pre_history,
-                pre_incumbent_text,
-                pre_incumbent_pred,
-                step["batch"],
-            )
-        set_sampled_batch_selected_candidate(
-            step["agent"],
-            step["batch"],
-            selected_idx,
-        )
-        step["selected_text"] = step["batch"]["selected_text"]
-        maybe_print_answer_candidate_selection_debug(
-            sample_idx,
-            rnd,
-            step["batch"],
-            selected_idx,
-            selected_meta,
-        )
         answer_rewards = compute_answer_candidate_rewards(
-            question,
             step["batch"],
-            verifier,
-            rnd,
-            pre_history,
-            pre_incumbent_text,
-            pre_incumbent_pred,
             gt,
         )
         gspo_update_payload = (
@@ -1860,87 +1608,54 @@ def run_three_layer_realized_action(
             gt,
             silent_baseline,
         )
+        candidate_middle_values = [float(v) for v in middle_answer_values]
+        selected_idx = int(step["batch"].get("selected_idx", 0))
+        if middle_answer_values:
+            selected_idx = max(0, min(selected_idx, len(middle_answer_values) - 1))
+            realized_middle_value = middle_answer_values[selected_idx]
         current_pred = extract_pred_num(step["selected_text"])
-        decision = evaluate_answer_revision(
-            verifier,
-            question,
+        incumbent_text = step["selected_text"]
+        incumbent_pred = current_pred
+        incumbent_reward = reward_from_pred(incumbent_pred, gt)
+        history = append_round_output(
+            history,
             rnd,
-            pre_history,
-            pre_incumbent_text,
-            pre_incumbent_pred,
+            f"agent{selected_agent}_pi1",
             step["selected_text"],
-            current_pred,
-            gt,
+            "answer",
         )
-        realized_middle_value = middle_answer_values[step["batch"]["selected_idx"]]
-        accepted = decision["accept"]
-        verifier_prob = decision["verifier_prob"]
-        accept_threshold = decision["accept_threshold"]
-        accept_keep_prob = decision["accept_keep_prob"]
-        accept_barrier = decision["accept_barrier"]
-        accept_margin = decision["accept_margin"]
-        accept_reason = decision["accept_reason"]
-        accept_update_payload = (
-            build_accept_update_payload(
-                question,
-                pre_history,
-                pre_incumbent_text,
-                pre_incumbent_pred,
-                reward_from_pred(pre_incumbent_pred, gt),
-                step["batch"],
-                gt,
-            )
-        )
-
-        if accepted:
-            incumbent_text = step["selected_text"]
-            incumbent_pred = current_pred
-            incumbent_reward = reward_from_pred(incumbent_pred, gt)
-            incumbent_changed = (
-                pre_incumbent_text != incumbent_text
-                or pre_incumbent_pred != incumbent_pred
-            )
-            history = append_round_output(
-                history,
-                rnd,
-                f"agent{selected_agent}_pi1",
-                step["selected_text"],
-                "answer",
-            )
-        else:
-            history = append_round_output(
-                history,
-                rnd,
-                f"agent{selected_agent}_verifier",
-                "候选修订未通过 verifier，保持 incumbent 不变。",
-                "meta",
-            )
+        for cand, cand_value in zip(step["batch"]["candidates"], candidate_middle_values):
+            cand_pred = extract_pred_num(cand["text"])
+            candidate_outcomes.append({
+                "history": append_round_output(
+                    pre_history,
+                    rnd,
+                    f"agent{selected_agent}_pi1",
+                    cand["text"],
+                    "answer",
+                ),
+                "incumbent_text": cand["text"],
+                "incumbent_pred": cand_pred,
+                "current_pred": cand_pred,
+                "realized_value": cand_value,
+            })
     return {
         "history": history,
         "incumbent_text": incumbent_text,
         "incumbent_pred": incumbent_pred,
         "incumbent_reward": incumbent_reward,
         "current_pred": current_pred,
-        "accepted": accepted,
-        "verifier_prob": verifier_prob,
-        "accept_threshold": accept_threshold,
-        "accept_keep_prob": accept_keep_prob,
-        "accept_barrier": accept_barrier,
-        "accept_margin": accept_margin,
-        "accept_reason": accept_reason,
         "realized_value": realized_middle_value,
+        "candidate_middle_values": candidate_middle_values,
+        "candidate_outcomes": candidate_outcomes,
         "step": step,
-        "accept_update_payload": accept_update_payload,
         "gspo_update_payload": gspo_update_payload,
-        "has_answer_candidates": has_answer_candidates,
-        "incumbent_changed": incumbent_changed,
     }
 
-def update_three_layer_regrets(
+def prepare_three_layer_regret_context(
     outer_cfr,
     middle_cfr,
     agents,
-    verifier,
     question,
     gt,
     rnd,
@@ -1953,11 +1668,8 @@ def update_three_layer_regrets(
     allowed_actions,
     selected_middle_strategy,
     pre_history,
-    pre_incumbent_text,
     pre_incumbent_pred,
-    keep_prob,
     allow_silent,
-    realized_value,
 ):
     """
     统一做“中层 regret 更新 + 外层 regret 更新”。
@@ -1973,128 +1685,178 @@ def update_three_layer_regrets(
       当前 phase 下，如果这轮换不同 agent 出场，
       各 agent 在“当前中层策略下的期望中层 value”分别是多少
     """
-    middle_estimate_cache = {}
     selected_allowed_actions = list(allowed_actions)
+    middle_estimate_cache = {}
+    base_middle_action_values = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
 
-    if len(selected_allowed_actions) == 1:
-        middle_action_values = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
-        middle_action_values[act] = realized_value
-    else:
-        middle_action_values, selected_allowed_actions = get_cached_middle_estimate(
+    if len(selected_allowed_actions) > 1:
+        base_middle_action_values, selected_allowed_actions = get_cached_middle_estimate(
             middle_estimate_cache,
             question,
             gt,
             agents,
-            middle_cfr,
             phase,
             selected_agent,
             rnd,
             pre_history,
-            pre_incumbent_text,
             pre_incumbent_pred,
-            verifier,
-            keep_prob,
             allow_silent,
-            known_action=act,
-            known_value=realized_value,
         )
-    outer_action_values = None
+    outer_agent_context = {}
     if outer_cfr is not None:
-        outer_action_values = np.zeros(len(allowed_agents), dtype=np.float64)
         for agent_idx in allowed_agents:
             if agent_idx == selected_agent:
-                agent_middle_strategy = selected_middle_strategy
+                continue
+            _, _, agent_middle_strategy = get_constrained_middle_strategy(
+                middle_cfr,
+                phase,
+                rnd,
+                agent_idx,
+                pre_incumbent_pred,
+                allow_silent=allow_silent,
+            )
+            agent_middle_values, _ = get_cached_middle_estimate(
+                middle_estimate_cache,
+                question,
+                gt,
+                agents,
+                phase,
+                agent_idx,
+                rnd,
+                pre_history,
+                pre_incumbent_pred,
+                allow_silent,
+            )
+            outer_agent_context[agent_idx] = {
+                "middle_values": np.array(agent_middle_values, copy=True),
+                "middle_strategy": np.array(agent_middle_strategy, copy=True),
+            }
+
+    return {
+        "outer_cfr": outer_cfr,
+        "middle_cfr": middle_cfr,
+        "outer_state": outer_state,
+        "middle_state": middle_state,
+        "selected_agent": selected_agent,
+        "act": act,
+        "allowed_agents": list(allowed_agents),
+        "selected_allowed_actions": list(selected_allowed_actions),
+        "selected_middle_strategy": np.array(selected_middle_strategy, copy=True),
+        "base_middle_action_values": np.array(base_middle_action_values, copy=True),
+        "outer_agent_context": outer_agent_context,
+    }
+
+def apply_prepared_three_layer_regret_update(
+    regret_context,
+    realized_value,
+    update_regrets=True,
+):
+    selected_allowed_actions = regret_context["selected_allowed_actions"]
+    middle_action_values = np.array(
+        regret_context["base_middle_action_values"],
+        copy=True,
+    )
+    middle_action_values[regret_context["act"]] = float(realized_value)
+
+    outer_action_values = None
+    if regret_context["outer_cfr"] is not None:
+        outer_action_values = np.zeros(len(regret_context["allowed_agents"]), dtype=np.float64)
+        for agent_idx in regret_context["allowed_agents"]:
+            if agent_idx == regret_context["selected_agent"]:
                 agent_middle_values = middle_action_values
+                agent_middle_strategy = regret_context["selected_middle_strategy"]
             else:
-                _, agent_allowed_actions, agent_middle_strategy = get_constrained_middle_strategy(
-                    middle_cfr,
-                    phase,
-                    rnd,
-                    agent_idx,
-                    pre_incumbent_pred,
-                    keep_prob,
-                    allow_silent=allow_silent,
-                )
-                agent_middle_values, _ = get_cached_middle_estimate(
-                    middle_estimate_cache,
-                    question,
-                    gt,
-                    agents,
-                    middle_cfr,
-                    phase,
-                    agent_idx,
-                    rnd,
-                    pre_history,
-                    pre_incumbent_text,
-                    pre_incumbent_pred,
-                    verifier,
-                    keep_prob,
-                    allow_silent,
-                )
+                agent_middle_values = regret_context["outer_agent_context"][agent_idx]["middle_values"]
+                agent_middle_strategy = regret_context["outer_agent_context"][agent_idx]["middle_strategy"]
             outer_action_values[agent_idx] = compute_outer_agent_value(
                 agent_middle_values,
                 agent_middle_strategy,
             )
 
-    if len(selected_allowed_actions) > 1:
-        middle_cfr.update_regret(
-            middle_state,
-            act,
+    if update_regrets and len(selected_allowed_actions) > 1:
+        regret_context["middle_cfr"].update_regret(
+            regret_context["middle_state"],
+            regret_context["act"],
             middle_action_values,
             allowed_actions=selected_allowed_actions,
         )
 
-    if outer_cfr is not None:
-        outer_cfr.update_regret(
-            outer_state,
-            selected_agent,
+    if update_regrets and regret_context["outer_cfr"] is not None:
+        regret_context["outer_cfr"].update_regret(
+            regret_context["outer_state"],
+            regret_context["selected_agent"],
             outer_action_values,
-            allowed_actions=allowed_agents,
+            allowed_actions=regret_context["allowed_agents"],
         )
 
-def apply_three_layer_policy_updates(
-    verifier,
-    gspo_update_payload,
-    accept_update_payload,
+    return middle_action_values, outer_action_values
+
+def update_three_layer_regrets(
+    outer_cfr,
+    middle_cfr,
+    agents,
     question,
-    history,
-    incumbent_text,
-    incumbent_reward,
-    should_update_keep,
+    gt,
+    rnd,
+    phase,
+    selected_agent,
+    act,
+    outer_state,
+    allowed_agents,
+    middle_state,
+    allowed_actions,
+    selected_middle_strategy,
+    pre_history,
+    pre_incumbent_pred,
+    allow_silent,
+    realized_value,
+    update_regrets=True,
+):
+    regret_context = prepare_three_layer_regret_context(
+        outer_cfr,
+        middle_cfr,
+        agents,
+        question,
+        gt,
+        rnd,
+        phase,
+        selected_agent,
+        act,
+        outer_state,
+        allowed_agents,
+        middle_state,
+        allowed_actions,
+        selected_middle_strategy,
+        pre_history,
+        pre_incumbent_pred,
+        allow_silent,
+    )
+    return apply_prepared_three_layer_regret_update(
+        regret_context,
+        realized_value,
+        update_regrets=update_regrets,
+    )
+
+def apply_three_layer_policy_updates(
+    gspo_update_payload,
 ):
     """
     统一做“真实轨迹执行完之后”的在线学习更新。
 
-    这里分三类学习器：
-    - verifier scorer:
-      学“每条 answer utterance 本身的绝对质量分数”
-      同时学“更优 utterance 的分数应高于更差 utterance”
-    - GSPO policy:
-      学“这轮真正生成的文本在组内候选里是否值得被偏好”
+    当前共享策略栈只保留 GSPO 更新：
+    - 真实轨迹里产生的一批 candidates
+    - 配上本轮定义好的 reward/value
+    - 做一次组内相对偏好更新
 
     注意时序：
     - 这些更新影响的是“下一轮以后”的行为
-    - 不会回头修改本轮已经发生的 accepted / rejected 决策
+    - 不会回头修改本轮已经发生的真实轨迹
     """
-    accept_update_stats = None
-    if accept_update_payload is not None:
-        accept_update_stats = verifier.update_accept_batch(*accept_update_payload)
-
-    if should_update_keep and incumbent_text is not None:
-        verifier.update_keep(
-            question,
-            history,
-            incumbent_text,
-            incumbent_reward,
-        )
-
     if gspo_update_payload is not None:
         gspo_update_payload[0].update_from_cached(
             gspo_update_payload[1],
             gspo_update_payload[2],
         )
-
-    return accept_update_stats
 
 def record_three_layer_round(
     buffers,
@@ -2424,8 +2186,6 @@ def run_single_gspo(
                     rewards = compute_comment_candidate_rewards(
                         step,
                         {"pi1": agent},
-                        None,
-                        None,
                         last_pred,
                         gt,
                     )
@@ -2538,8 +2298,6 @@ def run_dual_gspo(
                     rewards = compute_comment_candidate_rewards(
                         step,
                         {"pi1": solver},
-                        None,
-                        None,
                         last_pred,
                         gt,
                     )
@@ -2578,8 +2336,8 @@ def build_policy_stack_runtime(use_outer_scheduler, num_agents, allow_silent=Tru
     middle_cfr = CFRBehaviorSelector(
         num_actions=CFR_NUM_ACTIONS,
         default_action=MIDDLE_ACTION_SILENT,
+        fallback_strategy_fn=build_middle_fallback_strategy,
     )
-    verifier = OnlineAnswerVerifier()
     agents = []
     for _ in range(num_agents):
         pi0 = GSPOAgentPolicy(is_coop=True)
@@ -2589,7 +2347,6 @@ def build_policy_stack_runtime(use_outer_scheduler, num_agents, allow_silent=Tru
         "agents": agents,
         "outer_cfr": outer_cfr,
         "middle_cfr": middle_cfr,
-        "verifier": verifier,
         "use_outer_scheduler": use_outer_scheduler,
         "num_agents": num_agents,
         "allow_silent": allow_silent,
@@ -2619,7 +2376,6 @@ def run_policy_stack_experiment(
     agents = runtime["agents"]
     outer_cfr = runtime["outer_cfr"]
     middle_cfr = runtime["middle_cfr"]
-    verifier = runtime["verifier"]
     resolved_num_agents = runtime["num_agents"]
     resolved_allow_silent = runtime.get("allow_silent", allow_silent)
 
@@ -2627,177 +2383,149 @@ def run_policy_stack_experiment(
     total_samples = len(data)
     for idx, item in enumerate(tqdm(data, desc=f"{exp_name} 按样本运行"), start=1):
         q, gt = item["question"], item["ground_truth"]
-        sample_state = init_three_layer_sample_state()
-        sample_state["incumbent_reward"] = reward_from_pred(
-            sample_state["incumbent_pred"],
-            gt,
-        )
+        active_branches = [init_three_layer_sample_state()]
+        representative_state = active_branches[0]
 
         for rnd in range(1, NUM_ROUNDS+1):
             round_start_time = time.perf_counter()
-            pre_history = sample_state["history"]
-            pre_incumbent_text = sample_state["incumbent_text"]
-            pre_incumbent_pred = sample_state["incumbent_pred"]
+            next_branches = []
+            representative_meta = None
 
-            phase, keep_prob, stability_score = compute_phase(
-                verifier,
-                q,
-                pre_history,
-                pre_incumbent_text,
-                rnd,
-            )
+            for branch_idx, branch_state in enumerate(active_branches):
+                pre_history = branch_state["history"]
+                pre_incumbent_text = branch_state["incumbent_text"]
+                pre_incumbent_pred = branch_state["incumbent_pred"]
 
-            if use_outer_scheduler:
-                outer_state, allowed_agents, outer_strategy, selected_agent = choose_outer_agent(
-                    outer_cfr,
-                    phase,
-                    num_agents=resolved_num_agents,
+                phase, phase_score = compute_phase(
+                    branch_state["prev_phase_value"],
+                    rnd,
                 )
-            else:
-                outer_state = None
-                allowed_agents = list(range(resolved_num_agents))
-                selected_agent = (rnd - 1) % max(resolved_num_agents, 1)
-                outer_strategy = np.zeros(resolved_num_agents, dtype=np.float64)
-                outer_strategy[selected_agent] = 1.0
 
-            middle_state, allowed_actions, middle_strategy, act = choose_middle_action(
-                middle_cfr,
-                phase,
-                rnd,
-                selected_agent,
-                pre_incumbent_pred,
-                keep_prob,
-                allow_silent=resolved_allow_silent,
-            )
+                if use_outer_scheduler:
+                    outer_state, allowed_agents, outer_strategy, selected_agent = choose_outer_agent(
+                        outer_cfr,
+                        phase,
+                        num_agents=resolved_num_agents,
+                    )
+                else:
+                    outer_state = None
+                    allowed_agents = list(range(resolved_num_agents))
+                    selected_agent = (rnd - 1) % max(resolved_num_agents, 1)
+                    outer_strategy = np.zeros(resolved_num_agents, dtype=np.float64)
+                    outer_strategy[selected_agent] = 1.0
 
-            round_result = run_three_layer_realized_action(
-                agents,
-                verifier,
-                idx,
-                q,
-                gt,
-                rnd,
-                selected_agent,
-                act,
-                phase,
-                pre_history,
-                pre_incumbent_text,
-                pre_incumbent_pred,
-                middle_strategy,
-            )
-            sample_state["history"] = round_result["history"]
-            sample_state["incumbent_text"] = round_result["incumbent_text"]
-            sample_state["incumbent_pred"] = round_result["incumbent_pred"]
-            sample_state["incumbent_reward"] = round_result["incumbent_reward"]
-            maybe_print_three_layer_stage(idx, rnd, "realized_action", round_start_time)
-
-            if update_params:
-                update_three_layer_regrets(
-                    outer_cfr,
+                middle_state, allowed_actions, middle_strategy, act = choose_middle_action(
                     middle_cfr,
+                    phase,
+                    rnd,
+                    selected_agent,
+                    pre_incumbent_pred,
+                    allow_silent=resolved_allow_silent,
+                )
+
+                round_result = run_three_layer_realized_action(
                     agents,
-                    verifier,
                     q,
                     gt,
                     rnd,
-                    phase,
                     selected_agent,
                     act,
-                    outer_state,
-                    allowed_agents,
-                    middle_state,
-                    allowed_actions,
-                    middle_strategy,
                     pre_history,
                     pre_incumbent_text,
                     pre_incumbent_pred,
-                    keep_prob,
-                    resolved_allow_silent,
-                    round_result["realized_value"],
                 )
-                maybe_print_three_layer_stage(idx, rnd, "middle_regret", round_start_time)
-                if use_outer_scheduler:
-                    maybe_print_three_layer_stage(idx, rnd, "outer_regret", round_start_time)
+                if branch_idx == 0:
+                    maybe_print_three_layer_stage(idx, rnd, "realized_action", round_start_time)
 
-                accept_update_stats = apply_three_layer_policy_updates(
-                    verifier,
-                    round_result["gspo_update_payload"],
-                    round_result["accept_update_payload"],
-                    q,
-                    sample_state["history"],
-                    sample_state["incumbent_text"],
-                    sample_state["incumbent_reward"],
-                    should_update_keep=(
-                        round_result["has_answer_candidates"]
-                        and round_result["incumbent_changed"]
-                    ),
-                )
-                maybe_print_three_layer_stage(idx, rnd, "policy_update", round_start_time)
-                maybe_print_accept_training_debug(
-                    idx,
-                    rnd,
-                    pre_incumbent_pred,
-                    round_result["current_pred"],
-                    round_result["accepted"],
-                    accept_update_stats,
-                )
+                if update_params:
+                    regret_context = prepare_three_layer_regret_context(
+                        outer_cfr,
+                        middle_cfr,
+                        agents,
+                        q,
+                        gt,
+                        rnd,
+                        phase,
+                        selected_agent,
+                        act,
+                        outer_state,
+                        allowed_agents,
+                        middle_state,
+                        allowed_actions,
+                        middle_strategy,
+                        pre_history,
+                        pre_incumbent_pred,
+                        resolved_allow_silent,
+                    )
+                    for realized_value in round_result["candidate_middle_values"]:
+                        apply_prepared_three_layer_regret_update(
+                            regret_context,
+                            realized_value,
+                            update_regrets=True,
+                        )
+                    if branch_idx == 0:
+                        maybe_print_three_layer_stage(idx, rnd, "middle_regret", round_start_time)
+                        if use_outer_scheduler:
+                            maybe_print_three_layer_stage(idx, rnd, "outer_regret", round_start_time)
 
-            if act != MIDDLE_ACTION_ANSWER:
-                sample_state["incumbent_reward"] = reward_from_pred(
-                    sample_state["incumbent_pred"],
+                    apply_three_layer_policy_updates(
+                        round_result["gspo_update_payload"],
+                    )
+                    if branch_idx == 0:
+                        maybe_print_three_layer_stage(idx, rnd, "policy_update", round_start_time)
+
+                branch_children = materialize_round_children(
+                    branch_state,
+                    round_result,
                     gt,
+                    rnd,
+                    expand_all=update_params,
                 )
+                next_branches.extend(child["state"] for child in branch_children)
 
-            transition = classify_round_transition(
-                pre_incumbent_pred,
-                sample_state["incumbent_pred"],
-                gt,
-            )
-            if transition["improved"] and sample_state["first_improve_round"] is None:
-                sample_state["first_improve_round"] = rnd
-            if transition["degraded"] and sample_state["first_degrade_round"] is None:
-                sample_state["first_degrade_round"] = rnd
-            if transition["stalled_wrong"] and sample_state["first_stalled_wrong_round"] is None:
-                sample_state["first_stalled_wrong_round"] = rnd
+                if representative_meta is None and branch_children:
+                    representative_meta = {
+                        "state": branch_children[0]["state"],
+                        "transition": branch_children[0]["transition"],
+                        "phase": phase,
+                        "phase_score": phase_score,
+                        "selected_agent": selected_agent,
+                        "act": act,
+                        "outer_strategy": outer_strategy,
+                        "middle_strategy": middle_strategy,
+                        "current_pred": branch_children[0]["outcome"]["current_pred"],
+                        "realized_value": branch_children[0]["outcome"]["realized_value"],
+                    }
 
-            sample_state["best_correct"] = sample_state["best_correct"] or bool(
-                compute_accuracy([sample_state["incumbent_pred"]], [gt])
-            )
+            active_branches = next_branches
+            representative_state = representative_meta["state"]
             record_three_layer_round(
                 buffers,
                 rnd,
                 gt,
-                sample_state["incumbent_pred"],
-                sample_state["best_correct"],
-                round_result["realized_value"],
+                representative_state["incumbent_pred"],
+                representative_state["best_correct"],
+                representative_meta["realized_value"],
                 outer_cfr,
                 middle_cfr,
-                outer_strategy,
-                middle_strategy,
-                phase,
-                transition,
+                representative_meta["outer_strategy"],
+                representative_meta["middle_strategy"],
+                representative_meta["phase"],
+                representative_meta["transition"],
             )
             maybe_print_three_layer_round_debug(
                 idx,
                 rnd,
-                phase,
-                keep_prob,
-                stability_score,
-                selected_agent,
-                act,
-                round_result["current_pred"],
-                sample_state["incumbent_pred"],
+                representative_meta["phase"],
+                representative_meta["phase_score"],
+                representative_meta["selected_agent"],
+                representative_meta["act"],
+                representative_meta["current_pred"],
+                representative_state["incumbent_pred"],
                 gt,
-                round_result["realized_value"],
-                outer_strategy,
-                middle_strategy,
-                round_result["accepted"],
-                round_result["verifier_prob"],
-                round_result["accept_threshold"],
-                round_result["accept_keep_prob"],
-                round_result["accept_barrier"],
-                round_result["accept_margin"],
-                round_result["accept_reason"],
+                representative_meta["realized_value"],
+                representative_meta["outer_strategy"],
+                representative_meta["middle_strategy"],
             )
 
         maybe_report_accuracy(
@@ -2811,10 +2539,10 @@ def run_policy_stack_experiment(
         print_three_layer_sample_monitor(
             idx,
             gt,
-            sample_state["incumbent_pred"],
-            sample_state["first_improve_round"],
-            sample_state["first_degrade_round"],
-            sample_state["first_stalled_wrong_round"],
+            representative_state["incumbent_pred"],
+            representative_state["first_improve_round"],
+            representative_state["first_degrade_round"],
+            representative_state["first_stalled_wrong_round"],
         )
 
     finalize_policy_stack_experiment(
@@ -2825,11 +2553,10 @@ def run_policy_stack_experiment(
     )
 
     if teardown:
-        agents, outer_cfr, middle_cfr, verifier = teardown_three_layer_runtime(
+        agents, outer_cfr, middle_cfr = teardown_three_layer_runtime(
             agents,
             outer_cfr,
             middle_cfr,
-            verifier,
         )
         runtime = None
     else:
@@ -2837,7 +2564,6 @@ def run_policy_stack_experiment(
             "agents": agents,
             "outer_cfr": outer_cfr,
             "middle_cfr": middle_cfr,
-            "verifier": verifier,
             "use_outer_scheduler": use_outer_scheduler,
             "num_agents": resolved_num_agents,
             "allow_silent": resolved_allow_silent,
