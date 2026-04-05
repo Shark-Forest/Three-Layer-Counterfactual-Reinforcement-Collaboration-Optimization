@@ -13,6 +13,13 @@
 3. 哪一层负责“选谁来发言”、哪一层负责“发什么类型的话”、哪一层负责“把这句话说好”。
 4. 如何同时训练外层调度、中层动作策略和内层文本策略，并保持训练与推理的一致性。
 
+当前轮次配置也已拆成两项：
+
+- `TRAIN_NUM_ROUNDS`：训练阶段使用的轮次
+- `INFER_NUM_ROUNDS`：验证 / 测试 / 基线推理阶段使用的轮次
+
+默认两者保持一致；当前默认值都是 `5`。
+
 ## 2. 八组实验
 
 当前主流程一共运行 8 组实验：
@@ -70,6 +77,9 @@
 - 状态来源：`phase`
 - 动作空间：agent 索引
 - 仅在 `全量策略` 中启用
+- `train` 时按当前 regret-matching 策略采样动作
+- `val/test` 时按训练阶段累计下来的、同一 `phase` 状态对应的 `strategy_sum` 归一化平均策略采样动作
+- 如果某个状态还没有平均策略统计量，则回退到当前策略
 
 当前 `phase` 规则很简单：
 
@@ -99,11 +109,14 @@
 当前中层直接使用最朴素的 regret-matching：
 
 - 每个状态维护 `silent / comment / answer` 的累计遗憾
-- 采样时直接按“正遗憾归一化”得到当前策略
+- `train` 时按“正遗憾归一化”得到当前策略并采样
+- `val/test` 时在同一 `search / stabilize` 状态下改用训练阶段累计 `strategy_sum` 归一化得到的平均策略并采样
+- 双层 / 三层共享策略栈在最后一轮也不强制 `answer`，仍由中层策略自己决定
 - 如果所有正遗憾都为 0，则使用状态相关初始化分布：
   - `search`：`comment = 1/2`，`answer = 1/2`，`silent = 0`
   - `stabilize`：`comment = 1/3`，`answer = 1/3`，`silent = 1/3`
 - 对无沉默实验，动作 mask 会自动把上面的初始化分布重新归一化到 `comment / answer`
+- 如果某个状态还没有平均策略统计量，则平均策略自动回退到当前策略
 - 不再额外施加 `search` 状态下的概率 floor / cap 约束
 
 另外还有两组“无沉默”消融：
@@ -190,7 +203,10 @@ GSM8K 现在统一采用：
 
 - `train` 会把真实 batch 展开成多条训练分支，并更新 CFR / GSPO
 - `val / test` 不更新参数，也不展开多分支，只沿 `selected_text` 单路径评估
+- `train` 的外层/中层动作来自当前 regret-matching 策略
+- `val / test` 的外层/中层动作来自训练全过程累计得到的平均策略
 - 三个阶段的 `phase` 都使用“上一轮该真实分支自己的单个 realized middle value”
+- 轮次数量也分开配置：`train` 用 `TRAIN_NUM_ROUNDS`，`val / test` 用 `INFER_NUM_ROUNDS`
 
 ### 5.3 哪些实验只做测试
 
@@ -200,6 +216,13 @@ GSM8K 现在统一采用：
 - `双LLM轮询`
 
 这两组直接在 `test` 上评估。
+它们没有中层策略，因此 answer / comment 的轮次切换完全由 prompt 节奏决定；默认 5 轮下自然是最后一轮 answer，并不是代码额外强制。
+
+统一统计口径补充：
+
+- 无论训练还是验证 / 测试，准确率始终使用“最近一次真正产生的 answer”
+- comment / silent 轮因为没有新 answer，才沿用上一条 answer
+- 如果新的 answer 不可解析，也按这次最新 answer 记分，不回退到更早的旧答案
 
 ## 6. 当前 reward / value 定义
 
@@ -296,7 +319,7 @@ GSM8K 现在统一采用：
 - 虚拟 rollout：每条 comment 轨迹只继续产生 1 个 answer
 - 反事实动作价值：只采样 1 个 counterfactual batch，不再做 batch 均值外再套一层 batch 均值
 
-当前中层的动作采样也直接使用 raw regret-matching 策略，不再对 `search` 状态施加额外的动作概率约束。
+当前中层在训练时直接使用 raw regret-matching 当前策略，在验证/测试时改用训练阶段累计得到的同状态平均策略；两者都不再对 `search` 状态施加额外的动作概率约束。
 
 对应更新逻辑见 [run_all.py](run_all.py#L1941)。
 

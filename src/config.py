@@ -15,7 +15,11 @@ TRAIN_VAL_TOTAL_LIMIT = None
 TEST_SAMPLE_LIMIT = None
 TRAIN_RATIO = 0.8
 DATA_SPLIT_SEED = 42
-NUM_ROUNDS = 5     # 固定5轮对话
+# 训练与推理轮次分开配置，默认保持一致。
+TRAIN_NUM_ROUNDS = 5
+INFER_NUM_ROUNDS = TRAIN_NUM_ROUNDS
+# 兼容旧代码保留；新代码请优先使用 TRAIN_NUM_ROUNDS / INFER_NUM_ROUNDS。
+NUM_ROUNDS = TRAIN_NUM_ROUNDS
 
 # 模型配置（魔塔社区 Phi-3）
 # 这里选用更强但仍相对可运行的 Phi-3 Mini Instruct 版本。
@@ -142,8 +146,8 @@ SEARCH_NO_INCUMBENT_MIN_ANSWER_PROB = 0.60
 SEARCH_NO_INCUMBENT_MAX_SILENT_PROB = 0.00
 SEARCH_LATE_ROUND_ANSWER_BONUS = 0.10
 SEARCH_SILENT_PENALTY = 0.03
-# 旧版本曾用它在“无 incumbent 的前几轮”强制 answer；
-# 当前版本只保留“最后一轮若仍无 incumbent，则强制 answer”这一物理约束。
+# 旧版本曾用它在“无 incumbent 的前几轮”强制 answer。
+# 当前共享策略栈实验已经不再对最后一轮施加强制 answer 约束；
 # 这里保留这个配置名仅为兼容旧实验记录。
 NO_INCUMBENT_FORCE_ANSWER_ROUNDS = 2
 ANSWER_CANDIDATE_CHANGE_BONUS = 0.01

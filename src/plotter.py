@@ -6,6 +6,14 @@ from src.config import *
 
 os.makedirs(PLOT_DIR, exist_ok=True)
 
+def _infer_logged_num_rounds(*logs):
+    max_round = 0
+    for log in logs:
+        rounds = log.get("round", [])
+        if rounds:
+            max_round = max(max_round, int(max(rounds)))
+    return max_round
+
 def _pick_cjk_font():
     candidates = [
         "SimHei",
@@ -34,6 +42,16 @@ def plot_accuracy_comparison():
     middle_no_silent = load_logs("middle_layer_no_silent")
     three = load_logs("three_layer")
     three_no_silent = load_logs("three_layer_no_silent")
+    num_rounds = _infer_logged_num_rounds(
+        single,
+        polling,
+        single_gspo,
+        dual_gspo,
+        middle,
+        middle_no_silent,
+        three,
+        three_no_silent,
+    )
 
     plt.figure(figsize=(13, 8))
     plt.plot(single["round"], single["accuracy"], "o-", label="单LLM", linewidth=2)
@@ -47,10 +65,10 @@ def plot_accuracy_comparison():
 
     plt.xlabel("对话轮次", fontsize=12)
     plt.ylabel("GSM8K解题准确率", fontsize=12)
-    plt.title(f"多组实验{NUM_ROUNDS}轮准确率对比", fontsize=14)
+    plt.title(f"多组实验{num_rounds}轮准确率对比", fontsize=14)
     plt.legend(fontsize=10)
     plt.grid(alpha=0.3)
-    plt.xticks(range(1, NUM_ROUNDS+1))
+    plt.xticks(range(1, num_rounds + 1))
     plt.savefig(f"{PLOT_DIR}/accuracy_comparison.png", dpi=300, bbox_inches="tight")
     plt.close()
 

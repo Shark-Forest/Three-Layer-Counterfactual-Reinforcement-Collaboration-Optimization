@@ -51,9 +51,10 @@ from src.plotter import plot_accuracy_comparison, plot_three_layer_details
 # - 改前如果不把历史输出写回，后面轮次其实看不到前面轮次说了什么
 # - 改后 history 会不断追加，模拟真实多轮对话
 #
-# 改动3：评论轮不输出新答案时，准确率沿用上一轮答案
-# - 这符合你的实验设定：评论轮本身不一定给最终答案
-# - 所以第 2/4 轮如果没有新答案，就用上一轮已有答案来统计“当前答案准确率”
+# 改动3：准确率始终看“最近一次真正产生的 answer”
+# - comment / silent 轮本身不产生新答案，所以准确率沿用上一轮 answer
+# - 但只要这一轮产生了新的 answer，就必须用这次最新 answer 来统计
+#   即使这次 answer 不可解析，准确率也应按这次最新 answer 记分，而不是偷偷沿用旧答案
 #
 # 改动4：GSPO 奖励改成“延迟更新”
 # - comment 先只缓存，不立刻更新
@@ -252,14 +253,14 @@ def update_last_pred(last_pred, current_pred, should_use_current_answer):
     - 每一轮都必须有一个新的答案
 
     改动后现在的逻辑是：
-    - 如果这一轮是 answer 轮，并且抽取到了数字答案，就更新 last_pred
-    - 如果这一轮是 comment 轮，或者没有抽取到新答案，就保留上一轮答案
+    - 如果这一轮是 answer 轮，就直接把“当前这次 answer 的解析结果”记为最新答案
+    - 如果这一轮是 comment 轮，就保留上一轮答案
 
     所以：
-    - 第 1/3/5 轮常常会刷新答案
+    - 第 1/3/5 轮会刷新“当前答案”，即使这次 answer 不可解析也会刷新成 None
     - 第 2/4 轮通常沿用前一轮答案
     """
-    if should_use_current_answer and current_pred is not None:
+    if should_use_current_answer:
         return current_pred
     return last_pred
 
@@ -333,6 +334,12 @@ def build_split_size_message(train_data, val_data, test_data):
         f"val={len(val_data)} | "
         f"test={len(test_data)}"
     )
+
+def resolve_num_rounds(update_params):
+    return TRAIN_NUM_ROUNDS if update_params else INFER_NUM_ROUNDS
+
+def get_round_role(rnd):
+    return "solver" if rnd % 2 == 1 else "commenter"
 
 def reward_from_pred(pred_num, gt):
     """
@@ -456,21 +463,19 @@ def build_middle_fallback_strategy(state_key, allowed_actions, num_actions, defa
         fallback[MIDDLE_ACTION_ANSWER] = 1.0 / 3.0
     return fallback
 
-def get_middle_allowed_actions(rnd, incumbent_pred, allow_silent=True):
+def get_middle_allowed_actions(rnd, incumbent_pred, allow_silent=True, total_rounds=NUM_ROUNDS):
     """
     中层动作空间：
     - silent
     - comment
     - answer
 
-    只保留“物理上必须有”的约束：
-    - 最后一轮如果还没有 incumbent，必须 answer，避免整条样本没有答案
+    当前共享策略栈不再对最后一轮施加“必须 answer”的硬约束；
+    无论训练还是评测，最后一轮都允许策略自己选择 silent / comment / answer。
 
-    其余情况下，不再用手工规则把策略锁死给某个动作，
+    因此这里不再用手工规则把策略锁死给某个动作，
     而是让 middle CFR 在 phase 条件下自己学。
     """
-    if rnd == NUM_ROUNDS and incumbent_pred is None:
-        return [MIDDLE_ACTION_ANSWER]
     if allow_silent:
         return [
             MIDDLE_ACTION_SILENT,
@@ -539,11 +544,18 @@ def get_single_gspo_round_prompt(rnd):
 
     这里 rnd 是从 1 开始计数，所以要写 rnd - 1。
     """
-    return SINGLE_PROMPTS[rnd - 1]
+    if rnd <= len(SINGLE_PROMPTS):
+        return SINGLE_PROMPTS[rnd - 1]
 
-def get_next_answer_prompt(rnd):
-    next_idx = min(rnd, NUM_ROUNDS - 1)
-    return SINGLE_PROMPTS[next_idx]
+    desired_parity = rnd % 2
+    for idx in range(len(SINGLE_PROMPTS) - 1, -1, -1):
+        if (idx + 1) % 2 == desired_parity:
+            return SINGLE_PROMPTS[idx]
+    return SINGLE_PROMPTS[-1]
+
+def get_next_answer_prompt(rnd, total_rounds=NUM_ROUNDS):
+    next_round = min(rnd + 1, total_rounds)
+    return get_single_gspo_round_prompt(next_round)
 
 def get_three_layer_action_name(act):
     if act == MIDDLE_ACTION_SILENT:
@@ -552,13 +564,18 @@ def get_three_layer_action_name(act):
         return "pi0"
     return "pi1"
 
-def choose_outer_agent(scheduler, phase, num_agents=None):
+def choose_outer_agent(scheduler, phase, num_agents=None, use_average_strategy=False):
     state = build_outer_state(phase)
     allowed_agents = list(range(NUM_AGENTS if num_agents is None else num_agents))
-    strategy = scheduler.get_current_strategy(state, allowed_agents)
+    strategy = scheduler.get_strategy(
+        state,
+        allowed_agents,
+        use_average_strategy=use_average_strategy,
+    )
     selected_agent = scheduler.get_action(
         state_key=state,
         allowed_actions=allowed_agents,
+        use_average_strategy=use_average_strategy,
     )
     return state, allowed_agents, strategy, selected_agent
 
@@ -570,6 +587,8 @@ def get_constrained_middle_strategy(
     incumbent_pred,
     allow_silent=True,
     allowed_actions=None,
+    use_average_strategy=False,
+    total_rounds=NUM_ROUNDS,
 ):
     state = build_middle_state(selected_agent, phase)
     if allowed_actions is None:
@@ -577,10 +596,15 @@ def get_constrained_middle_strategy(
             rnd,
             incumbent_pred,
             allow_silent=allow_silent,
+            total_rounds=total_rounds,
         )
     # 兼容旧函数名保留接口；当前中层直接使用最朴素的 regret-matching
     # 原始策略，不再额外施加 search 状态下的 floor / cap 约束。
-    strategy = selector.get_current_strategy(state, allowed_actions)
+    strategy = selector.get_strategy(
+        state,
+        allowed_actions,
+        use_average_strategy=use_average_strategy,
+    )
     return state, allowed_actions, strategy
 
 def choose_middle_action(
@@ -590,6 +614,8 @@ def choose_middle_action(
     selected_agent,
     incumbent_pred,
     allow_silent=True,
+    use_average_strategy=False,
+    total_rounds=NUM_ROUNDS,
 ):
     state, allowed_actions, strategy = get_constrained_middle_strategy(
         selector,
@@ -598,6 +624,8 @@ def choose_middle_action(
         selected_agent,
         incumbent_pred,
         allow_silent=allow_silent,
+        use_average_strategy=use_average_strategy,
+        total_rounds=total_rounds,
     )
     act = int(np.random.choice(CFR_NUM_ACTIONS, p=strategy))
     return state, allowed_actions, strategy, act
@@ -689,7 +717,16 @@ def average_rollout_reward(question, history, answer_prompt, model, tokenizer, d
         rewards.append(reward_from_pred(pred, gt))
     return sum(rewards) / len(rewards) if rewards else 0.0
 
-def sample_gspo_step(agent, question, history, rnd, speaker, kind, prompt_override=None):
+def sample_gspo_step(
+    agent,
+    question,
+    history,
+    rnd,
+    speaker,
+    kind,
+    prompt_override=None,
+    total_rounds=None,
+):
     """
     GSPO 版本里，一轮 step 不只是“生成一条文本”，
     还要把训练更新所需的缓存一起带回来。
@@ -711,6 +748,7 @@ def sample_gspo_step(agent, question, history, rnd, speaker, kind, prompt_overri
         "speaker": speaker,
         "kind": kind,
         "prompt_override": prompt_override,
+        "total_rounds": total_rounds,
         "batch": batch,
         "selected_text": selected_text,
     }
@@ -945,11 +983,12 @@ def compute_comment_candidate_rewards(step, agent_bundle, incumbent_pred, gt):
     - 两者差值：
       就是这条 comment 对后续 answer 的边际帮助
     """
+    total_rounds = step.get("total_rounds") or NUM_ROUNDS
     without_comment = average_next_answer_reward(
         agent_bundle,
         step["question"],
         step["pre_history"],
-        min(step["round"] + 1, NUM_ROUNDS),
+        min(step["round"] + 1, total_rounds),
         incumbent_pred,
         gt,
     )
@@ -967,7 +1006,7 @@ def compute_comment_candidate_rewards(step, agent_bundle, incumbent_pred, gt):
             agent_bundle,
             step["question"],
             next_history,
-            min(step["round"] + 1, NUM_ROUNDS),
+            min(step["round"] + 1, total_rounds),
             incumbent_pred,
             gt,
         )
@@ -997,6 +1036,7 @@ def estimate_middle_silent_baseline(
     incumbent_pred,
     gt,
     num_samples=None,
+    total_rounds=NUM_ROUNDS,
 ):
     """
     中层动作 value 的共享静默基线：
@@ -1007,7 +1047,7 @@ def estimate_middle_silent_baseline(
         agent_bundle,
         question,
         history,
-        min(rnd + 1, NUM_ROUNDS),
+        min(rnd + 1, total_rounds),
         incumbent_pred,
         gt,
     )
@@ -1048,6 +1088,7 @@ def estimate_policy_stack_comment_value(
     comment_text=None,
     speaker="pi0_cf",
     silent_baseline=None,
+    total_rounds=NUM_ROUNDS,
 ):
     """
     comment 的价值恢复为旧定义：
@@ -1063,6 +1104,7 @@ def estimate_policy_stack_comment_value(
             rnd,
             incumbent_pred,
             gt,
+            total_rounds=total_rounds,
         )
     if comment_text is None:
         comment_text = agent_bundle["pi0"].sample_text(
@@ -1080,7 +1122,7 @@ def estimate_policy_stack_comment_value(
         agent_bundle,
         question,
         next_history,
-        min(rnd + 1, NUM_ROUNDS),
+        min(rnd + 1, total_rounds),
         incumbent_pred,
         gt,
     )
@@ -1093,6 +1135,7 @@ def compute_policy_stack_comment_candidate_rewards(
     gt,
     silent_baseline=None,
 ):
+    total_rounds = step.get("total_rounds") or NUM_ROUNDS
     if silent_baseline is None:
         silent_baseline = estimate_middle_silent_baseline(
             agent_bundle,
@@ -1101,6 +1144,7 @@ def compute_policy_stack_comment_candidate_rewards(
             step["round"],
             incumbent_pred,
             gt,
+            total_rounds=total_rounds,
         )
     rewards = []
     for cand in step["batch"]["candidates"]:
@@ -1115,6 +1159,7 @@ def compute_policy_stack_comment_candidate_rewards(
                 comment_text=cand["text"],
                 speaker=step["speaker"],
                 silent_baseline=silent_baseline,
+                total_rounds=total_rounds,
             )
         )
     return rewards
@@ -1150,6 +1195,7 @@ def estimate_policy_stack_answer_value(
     incumbent_pred,
     gt,
     silent_baseline=None,
+    total_rounds=NUM_ROUNDS,
 ):
     if silent_baseline is None:
         silent_baseline = estimate_middle_silent_baseline(
@@ -1159,6 +1205,7 @@ def estimate_policy_stack_answer_value(
             rnd,
             incumbent_pred,
             gt,
+            total_rounds=total_rounds,
         )
     batch = sample_counterfactual_policy_batch(
         agent_bundle["pi1"],
@@ -1177,6 +1224,7 @@ def estimate_policy_stack_comment_value_mean(
     incumbent_pred,
     gt,
     silent_baseline=None,
+    total_rounds=NUM_ROUNDS,
 ):
     if silent_baseline is None:
         silent_baseline = estimate_middle_silent_baseline(
@@ -1186,6 +1234,7 @@ def estimate_policy_stack_comment_value_mean(
             rnd,
             incumbent_pred,
             gt,
+            total_rounds=total_rounds,
         )
     batch = sample_counterfactual_policy_batch(
         agent_bundle["pi0"],
@@ -1198,6 +1247,7 @@ def estimate_policy_stack_comment_value_mean(
         "pre_history": history,
         "round": rnd,
         "speaker": "pi0_cf_batch",
+        "total_rounds": total_rounds,
         "batch": batch,
     }
     rewards = compute_policy_stack_comment_candidate_rewards(
@@ -1235,6 +1285,7 @@ def estimate_middle_action_values(
     allow_silent=True,
     known_action=None,
     known_value=None,
+    total_rounds=NUM_ROUNDS,
 ):
     """
     估计某个 agent 在当前 round/state 下的中层三动作价值。
@@ -1252,6 +1303,7 @@ def estimate_middle_action_values(
         rnd,
         incumbent_pred,
         allow_silent=allow_silent,
+        total_rounds=total_rounds,
     )
     values = np.zeros(CFR_NUM_ACTIONS, dtype=np.float64)
     agent_bundle = agents[selected_agent]
@@ -1262,6 +1314,7 @@ def estimate_middle_action_values(
         rnd,
         incumbent_pred,
         gt,
+        total_rounds=total_rounds,
     )
 
     if MIDDLE_ACTION_COMMENT in allowed_actions:
@@ -1276,6 +1329,7 @@ def estimate_middle_action_values(
                 incumbent_pred,
                 gt,
                 silent_baseline=silent_baseline,
+                total_rounds=total_rounds,
             )
     if MIDDLE_ACTION_ANSWER in allowed_actions:
         if known_action == MIDDLE_ACTION_ANSWER and known_value is not None:
@@ -1289,6 +1343,7 @@ def estimate_middle_action_values(
                 incumbent_pred,
                 gt,
                 silent_baseline=silent_baseline,
+                total_rounds=total_rounds,
             )
     if MIDDLE_ACTION_SILENT in allowed_actions:
         if known_action == MIDDLE_ACTION_SILENT and known_value is not None:
@@ -1317,6 +1372,7 @@ def get_cached_middle_estimate(
     allow_silent=True,
     known_action=None,
     known_value=None,
+    total_rounds=NUM_ROUNDS,
 ):
     """
     每轮每个 agent 的中层动作价值只估一次，并在本轮内复用。
@@ -1325,7 +1381,7 @@ def get_cached_middle_estimate(
     - 中层 regret 更新会用到它
     - 外层调度 regret 也直接复用同一份 value vector
     """
-    cache_key = (agent_idx, phase, rnd, bool(allow_silent))
+    cache_key = (agent_idx, phase, rnd, bool(allow_silent), int(total_rounds))
     cached = cache.get(cache_key)
     if cached is not None:
         values, allowed_actions = cached
@@ -1345,11 +1401,12 @@ def get_cached_middle_estimate(
         allow_silent,
         known_action=known_action,
         known_value=known_value,
+        total_rounds=total_rounds,
     )
     cache[cache_key] = (np.array(values, copy=True), list(allowed_actions))
     return values, allowed_actions
 
-def init_three_layer_round_buffers():
+def init_three_layer_round_buffers(num_rounds):
     """
     初始化“三层策略实验”的整轮统计容器。
 
@@ -1365,19 +1422,19 @@ def init_three_layer_round_buffers():
     - 画图和写 CSV 都会更方便
     """
     return {
-        "round_preds": [[] for _ in range(NUM_ROUNDS)],
-        "round_gts": [[] for _ in range(NUM_ROUNDS)],
-        "best_round_hits": [[] for _ in range(NUM_ROUNDS)],
-        "round_rewards": [[] for _ in range(NUM_ROUNDS)],
-        "round_regrets": [[] for _ in range(NUM_ROUNDS)],
-        "round_outer_probs": [[] for _ in range(NUM_ROUNDS)],
-        "round_middle_probs": [[] for _ in range(NUM_ROUNDS)],
-        "round_search_flags": [[] for _ in range(NUM_ROUNDS)],
-        "round_stabilize_flags": [[] for _ in range(NUM_ROUNDS)],
-        "round_improve_flags": [[] for _ in range(NUM_ROUNDS)],
-        "round_degrade_flags": [[] for _ in range(NUM_ROUNDS)],
-        "round_stalled_wrong_flags": [[] for _ in range(NUM_ROUNDS)],
-        "round_preserved_correct_flags": [[] for _ in range(NUM_ROUNDS)],
+        "round_preds": [[] for _ in range(num_rounds)],
+        "round_gts": [[] for _ in range(num_rounds)],
+        "best_round_hits": [[] for _ in range(num_rounds)],
+        "round_rewards": [[] for _ in range(num_rounds)],
+        "round_regrets": [[] for _ in range(num_rounds)],
+        "round_outer_probs": [[] for _ in range(num_rounds)],
+        "round_middle_probs": [[] for _ in range(num_rounds)],
+        "round_search_flags": [[] for _ in range(num_rounds)],
+        "round_stabilize_flags": [[] for _ in range(num_rounds)],
+        "round_improve_flags": [[] for _ in range(num_rounds)],
+        "round_degrade_flags": [[] for _ in range(num_rounds)],
+        "round_stalled_wrong_flags": [[] for _ in range(num_rounds)],
+        "round_preserved_correct_flags": [[] for _ in range(num_rounds)],
     }
 
 def init_three_layer_sample_state():
@@ -1466,6 +1523,7 @@ def run_three_layer_realized_action(
     pre_history,
     pre_incumbent_text,
     pre_incumbent_pred,
+    total_rounds=NUM_ROUNDS,
 ):
     """
     执行三层策略在“真实轨迹”里的这一步动作。
@@ -1528,6 +1586,7 @@ def run_three_layer_realized_action(
             rnd,
             pre_incumbent_pred,
             gt,
+            total_rounds=total_rounds,
         )
         step = sample_gspo_step(
             agents[selected_agent]["pi0"],
@@ -1537,6 +1596,7 @@ def run_three_layer_realized_action(
             f"agent{selected_agent}_pi0",
             "comment",
             prompt_override=PI0_PROMPT,
+            total_rounds=total_rounds,
         )
         comment_rewards = compute_policy_stack_comment_candidate_rewards(
             step,
@@ -1584,6 +1644,7 @@ def run_three_layer_realized_action(
             rnd,
             pre_incumbent_pred,
             gt,
+            total_rounds=total_rounds,
         )
         step = sample_gspo_step(
             agents[selected_agent]["pi1"],
@@ -1593,6 +1654,7 @@ def run_three_layer_realized_action(
             f"agent{selected_agent}_pi1",
             "answer",
             prompt_override=PI1_PROMPT,
+            total_rounds=total_rounds,
         )
         answer_rewards = compute_answer_candidate_rewards(
             step["batch"],
@@ -1670,6 +1732,7 @@ def prepare_three_layer_regret_context(
     pre_history,
     pre_incumbent_pred,
     allow_silent,
+    total_rounds=NUM_ROUNDS,
 ):
     """
     统一做“中层 regret 更新 + 外层 regret 更新”。
@@ -1701,6 +1764,7 @@ def prepare_three_layer_regret_context(
             pre_history,
             pre_incumbent_pred,
             allow_silent,
+            total_rounds=total_rounds,
         )
     outer_agent_context = {}
     if outer_cfr is not None:
@@ -1714,6 +1778,7 @@ def prepare_three_layer_regret_context(
                 agent_idx,
                 pre_incumbent_pred,
                 allow_silent=allow_silent,
+                total_rounds=total_rounds,
             )
             agent_middle_values, _ = get_cached_middle_estimate(
                 middle_estimate_cache,
@@ -1726,6 +1791,7 @@ def prepare_three_layer_regret_context(
                 pre_history,
                 pre_incumbent_pred,
                 allow_silent,
+                total_rounds=total_rounds,
             )
             outer_agent_context[agent_idx] = {
                 "middle_values": np.array(agent_middle_values, copy=True),
@@ -1905,8 +1971,9 @@ def finalize_policy_stack_experiment(buffers, exp_name, log_fn, log_metrics=True
 
     这里的工作基本都是“把前面累计好的列表做平均”。
     """
+    num_rounds = len(buffers["round_preds"])
     total_reward = 0.0
-    for rnd in range(1, NUM_ROUNDS+1):
+    for rnd in range(1, num_rounds + 1):
         acc = compute_accuracy(buffers["round_preds"][rnd-1], buffers["round_gts"][rnd-1])
         best_acc = compute_best_so_far_accuracies(buffers["best_round_hits"])[rnd-1]
         avg_reward = (
@@ -2001,9 +2068,10 @@ def run_single_llm(data, exp_name="单LLM", log_metrics=True, log_key="single"):
     - 再统一跑第2轮
     """
     print(f"\n=== 开始运行{exp_name}实验 ===")
-    round_preds = [[] for _ in range(NUM_ROUNDS)]
-    round_gts = [[] for _ in range(NUM_ROUNDS)]
-    best_round_hits = [[] for _ in range(NUM_ROUNDS)]
+    num_rounds = INFER_NUM_ROUNDS
+    round_preds = [[] for _ in range(num_rounds)]
+    round_gts = [[] for _ in range(num_rounds)]
+    best_round_hits = [[] for _ in range(num_rounds)]
 
     total_samples = len(data)
     for idx, item in enumerate(tqdm(data, desc="单LLM 按样本运行"), start=1):
@@ -2013,8 +2081,8 @@ def run_single_llm(data, exp_name="单LLM", log_metrics=True, log_key="single"):
         last_pred = None
         best_correct = False
 
-        for rnd in range(1, NUM_ROUNDS+1):
-            prompt = SINGLE_PROMPTS[rnd-1]
+        for rnd in range(1, num_rounds + 1):
+            prompt = get_single_gspo_round_prompt(rnd)
             ctx = build_context(q, history)
             res = generate_response(prompt.format(context=ctx))
 
@@ -2036,7 +2104,7 @@ def run_single_llm(data, exp_name="单LLM", log_metrics=True, log_key="single"):
 
         maybe_report_accuracy(exp_name, idx, total_samples, round_preds, round_gts, best_round_hits)
 
-    for rnd in range(1, NUM_ROUNDS+1):
+    for rnd in range(1, num_rounds + 1):
         acc = compute_accuracy(round_preds[rnd-1], round_gts[rnd-1])
         best_acc = compute_best_so_far_accuracies(best_round_hits)[rnd-1]
         if log_metrics:
@@ -2066,10 +2134,10 @@ def run_polling_two_llms(data, exp_name="双LLM轮询", log_metrics=True, log_ke
     这里的“轮询”只是角色轮询，不是样本调度轮询。
     """
     print(f"\n=== 开始运行{exp_name}实验 ===")
-    round_role = ["solver", "commenter", "solver", "commenter", "solver"]
-    round_preds = [[] for _ in range(NUM_ROUNDS)]
-    round_gts = [[] for _ in range(NUM_ROUNDS)]
-    best_round_hits = [[] for _ in range(NUM_ROUNDS)]
+    num_rounds = INFER_NUM_ROUNDS
+    round_preds = [[] for _ in range(num_rounds)]
+    round_gts = [[] for _ in range(num_rounds)]
+    best_round_hits = [[] for _ in range(num_rounds)]
 
     total_samples = len(data)
     for idx, item in enumerate(tqdm(data, desc="双LLM轮询 按样本运行"), start=1):
@@ -2079,8 +2147,8 @@ def run_polling_two_llms(data, exp_name="双LLM轮询", log_metrics=True, log_ke
         last_pred = None
         best_correct = False
 
-        for rnd in range(1, NUM_ROUNDS+1):
-            role = round_role[rnd-1]
+        for rnd in range(1, num_rounds + 1):
+            role = get_round_role(rnd)
             ctx = build_context(q, history)
             if role == "solver":
                 res = generate_response(SOLVER_PROMPT.format(context=ctx))
@@ -2102,7 +2170,7 @@ def run_polling_two_llms(data, exp_name="双LLM轮询", log_metrics=True, log_ke
 
         maybe_report_accuracy(exp_name, idx, total_samples, round_preds, round_gts, best_round_hits)
 
-    for rnd in range(1, NUM_ROUNDS+1):
+    for rnd in range(1, num_rounds + 1):
         acc = compute_accuracy(round_preds[rnd-1], round_gts[rnd-1])
         best_acc = compute_best_so_far_accuracies(best_round_hits)[rnd-1]
         if log_metrics:
@@ -2139,9 +2207,10 @@ def run_single_gspo(
     print(f"\n=== 开始运行{exp_name}实验 ===")
     if agent is None:
         agent = GSPOAgentPolicy(is_coop=False)
-    round_preds = [[] for _ in range(NUM_ROUNDS)]
-    round_gts = [[] for _ in range(NUM_ROUNDS)]
-    best_round_hits = [[] for _ in range(NUM_ROUNDS)]
+    num_rounds = resolve_num_rounds(update_params)
+    round_preds = [[] for _ in range(num_rounds)]
+    round_gts = [[] for _ in range(num_rounds)]
+    best_round_hits = [[] for _ in range(num_rounds)]
 
     total_samples = len(data)
     for idx, item in enumerate(tqdm(data, desc="单LLM GSPO 按样本运行"), start=1):
@@ -2151,7 +2220,7 @@ def run_single_gspo(
         last_pred = None
         best_correct = False
 
-        for rnd in range(1, NUM_ROUNDS+1):
+        for rnd in range(1, num_rounds + 1):
             prompt = get_single_gspo_round_prompt(rnd)
             is_answer_round = (rnd % 2 == 1)
             speaker = "single_gspo_answer" if is_answer_round else "single_gspo_comment"
@@ -2163,6 +2232,7 @@ def run_single_gspo(
                 speaker,
                 "answer" if is_answer_round else "comment",
                 prompt_override=prompt,
+                total_rounds=num_rounds,
             )
             res = step["selected_text"]
             # 这里明确使用 selected_text，而不是 best_text。
@@ -2198,7 +2268,7 @@ def run_single_gspo(
 
         maybe_report_accuracy(exp_name, idx, total_samples, round_preds, round_gts, best_round_hits)
 
-    for rnd in range(1, NUM_ROUNDS+1):
+    for rnd in range(1, num_rounds + 1):
         acc = compute_accuracy(round_preds[rnd-1], round_gts[rnd-1])
         best_acc = compute_best_so_far_accuracies(best_round_hits)[rnd-1]
         if log_metrics:
@@ -2240,10 +2310,10 @@ def run_dual_gspo(
         solver = GSPOAgentPolicy(is_coop=False)
     if commenter is None:
         commenter = GSPOAgentPolicy(is_coop=True)
-    round_role = ["solver", "commenter", "solver", "commenter", "solver"]
-    round_preds = [[] for _ in range(NUM_ROUNDS)]
-    round_gts = [[] for _ in range(NUM_ROUNDS)]
-    best_round_hits = [[] for _ in range(NUM_ROUNDS)]
+    num_rounds = resolve_num_rounds(update_params)
+    round_preds = [[] for _ in range(num_rounds)]
+    round_gts = [[] for _ in range(num_rounds)]
+    best_round_hits = [[] for _ in range(num_rounds)]
 
     total_samples = len(data)
     for idx, item in enumerate(tqdm(data, desc="双LLM GSPO轮询 按样本运行"), start=1):
@@ -2253,8 +2323,8 @@ def run_dual_gspo(
         last_pred = None
         best_correct = False
 
-        for rnd in range(1, NUM_ROUNDS+1):
-            role = round_role[rnd-1]
+        for rnd in range(1, num_rounds + 1):
+            role = get_round_role(rnd)
             if role == "solver":
                 step = sample_gspo_step(
                     solver,
@@ -2264,6 +2334,7 @@ def run_dual_gspo(
                     role,
                     "answer",
                     prompt_override=SOLVER_PROMPT,
+                    total_rounds=num_rounds,
                 )
                 res = step["selected_text"]
                 current_pred = extract_pred_num(res)
@@ -2277,6 +2348,7 @@ def run_dual_gspo(
                     role,
                     "comment",
                     prompt_override=COMMENTER_PROMPT,
+                    total_rounds=num_rounds,
                 )
                 res = step["selected_text"]
 
@@ -2309,7 +2381,7 @@ def run_dual_gspo(
 
         maybe_report_accuracy(exp_name, idx, total_samples, round_preds, round_gts, best_round_hits)
 
-    for rnd in range(1, NUM_ROUNDS+1):
+    for rnd in range(1, num_rounds + 1):
         acc = compute_accuracy(round_preds[rnd-1], round_gts[rnd-1])
         best_acc = compute_best_so_far_accuracies(best_round_hits)[rnd-1]
         if log_metrics:
@@ -2378,15 +2450,17 @@ def run_policy_stack_experiment(
     middle_cfr = runtime["middle_cfr"]
     resolved_num_agents = runtime["num_agents"]
     resolved_allow_silent = runtime.get("allow_silent", allow_silent)
+    use_average_strategy = not update_params
+    num_rounds = resolve_num_rounds(update_params)
 
-    buffers = init_three_layer_round_buffers()
+    buffers = init_three_layer_round_buffers(num_rounds)
     total_samples = len(data)
     for idx, item in enumerate(tqdm(data, desc=f"{exp_name} 按样本运行"), start=1):
         q, gt = item["question"], item["ground_truth"]
         active_branches = [init_three_layer_sample_state()]
         representative_state = active_branches[0]
 
-        for rnd in range(1, NUM_ROUNDS+1):
+        for rnd in range(1, num_rounds + 1):
             round_start_time = time.perf_counter()
             next_branches = []
             representative_meta = None
@@ -2406,6 +2480,7 @@ def run_policy_stack_experiment(
                         outer_cfr,
                         phase,
                         num_agents=resolved_num_agents,
+                        use_average_strategy=use_average_strategy,
                     )
                 else:
                     outer_state = None
@@ -2421,6 +2496,8 @@ def run_policy_stack_experiment(
                     selected_agent,
                     pre_incumbent_pred,
                     allow_silent=resolved_allow_silent,
+                    use_average_strategy=use_average_strategy,
+                    total_rounds=num_rounds,
                 )
 
                 round_result = run_three_layer_realized_action(
@@ -2433,6 +2510,7 @@ def run_policy_stack_experiment(
                     pre_history,
                     pre_incumbent_text,
                     pre_incumbent_pred,
+                    total_rounds=num_rounds,
                 )
                 if branch_idx == 0:
                     maybe_print_three_layer_stage(idx, rnd, "realized_action", round_start_time)
@@ -2456,6 +2534,7 @@ def run_policy_stack_experiment(
                         pre_history,
                         pre_incumbent_pred,
                         resolved_allow_silent,
+                        total_rounds=num_rounds,
                     )
                     for realized_value in round_result["candidate_middle_values"]:
                         apply_prepared_three_layer_regret_update(

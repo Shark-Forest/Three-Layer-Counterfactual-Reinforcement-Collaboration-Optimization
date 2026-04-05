@@ -90,11 +90,27 @@ class CFRBehaviorSelector:
             return strategy_sum / total
         return self.get_current_strategy(state_key, allowed_actions)
 
-    def get_action(self, state_key=None, explore=True, allowed_actions=None, force_action=None):
+    def get_strategy(self, state_key=None, allowed_actions=None, use_average_strategy=False):
+        if use_average_strategy:
+            return self.get_average_strategy(state_key, allowed_actions)
+        return self.get_current_strategy(state_key, allowed_actions)
+
+    def get_action(
+        self,
+        state_key=None,
+        explore=True,
+        allowed_actions=None,
+        force_action=None,
+        use_average_strategy=False,
+    ):
         if force_action is not None:
             return force_action
 
-        strategy = self.get_current_strategy(state_key, allowed_actions)
+        strategy = self.get_strategy(
+            state_key,
+            allowed_actions,
+            use_average_strategy=use_average_strategy,
+        )
         if explore:
             return int(np.random.choice(self.num_actions, p=strategy))
         return int(np.argmax(strategy))

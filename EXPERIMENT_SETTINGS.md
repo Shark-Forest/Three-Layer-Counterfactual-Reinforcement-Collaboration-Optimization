@@ -17,7 +17,9 @@
 
 ## 2. 轮次与模型
 
-- 固定多轮交互轮数：`NUM_ROUNDS = 5`
+- 训练轮次：`TRAIN_NUM_ROUNDS = 5`
+- 推理轮次：`INFER_NUM_ROUNDS = TRAIN_NUM_ROUNDS`
+- 默认保持训练 / 推理轮次一致。
 - 主 LLM：`LLM-Research/Phi-3-mini-4k-instruct`
 - 默认生成长度：`MAX_NEW_TOKENS = 128`
 - 默认采样温度：`TEMPERATURE = 0.3`
@@ -30,10 +32,17 @@
 1. `单LLM`
    - 只在 `test` 上评估。
    - 不更新任何参数。
+   - 默认 5 轮下靠 prompt 节奏自然在最后一轮作答，不存在额外“强制 answer”逻辑。
 
 2. `双LLM轮询`
    - 只在 `test` 上评估。
    - 不更新任何参数。
+   - 默认 5 轮下同样靠 solver / commenter 轮换自然在最后一轮作答，不存在额外“强制 answer”逻辑。
+
+补充统计口径：
+- 无论训练还是 `val/test`，准确率都使用最近一次真正产生的 answer
+- comment / silent 轮没有新 answer 时，才沿用上一条 answer
+- 如果最新 answer 不可解析，也按这次最新 answer 记分，不回退到更早的旧答案
 
 ### 3.2 需要训练的实验
 
@@ -76,6 +85,9 @@
 - 动作：选择哪个 agent 出场
 - 算法：`CFR / regret matching`
 - 默认外层 agent 数：`NUM_AGENTS = 2`
+- `train` 时按当前 regret-matching 策略采样 agent
+- `val/test` 时按训练阶段累计下来的、对应 `phase` 状态的平均策略采样 agent
+- 如果某个状态还没有平均策略统计量，则回退到当前策略
 
 ### 4.2 中间层动作策略
 
@@ -88,11 +100,14 @@
   - `answer`
 - 算法：`CFR / regret matching`
 - 当前直接使用 raw regret-matching：
-  - 正遗憾归一化为当前策略
+  - `train`：正遗憾归一化为当前策略
+  - `val/test`：同一 `search / stabilize` 状态下使用训练阶段累计 `strategy_sum` 归一化得到的平均策略
+  - 双层 / 三层共享策略栈最后一轮也不强制 `answer`
   - 若所有正遗憾都为 `0`，则使用状态相关初始化分布
   - `search`：`comment = 1/2`，`answer = 1/2`，`silent = 0`
   - `stabilize`：`comment = 1/3`，`answer = 1/3`，`silent = 1/3`
   - 无沉默实验会根据动作 mask 自动把初始化分布重新归一化到 `comment / answer`
+  - 若某个状态还没有平均策略统计量，则平均策略自动回退到当前策略
   - 不再额外施加 `search` 状态下的中层动作概率约束
 - 在不启用外层调度器的实验里：
   - 仍然保留多个 agent bundle
@@ -127,7 +142,7 @@
 - `全量策略`
 - `全量策略（中层无沉默）`
 
-当前规则已经统一成训练/验证/测试一致：
+当前规则已经统一成训练/验证/测试在轨迹语义上保持一致：
 
 1. `pi1` 先采样一批 answer 候选。
 2. 训练阶段，这一批 candidates 会展开成多条真实训练分支。
@@ -140,6 +155,9 @@
 - 内层 GSPO 始终使用整批 candidates 更新。
 - `train` 时，中层/外层也把这批 candidates 展开成多条真实训练分支。
 - `val/test` 时，不展开多分支，只沿 `selected_text` 做单路径评估。
+- `train` 时，外层/中层动作按当前 regret-matching 策略采样。
+- `val/test` 时，外层/中层动作按训练全过程累计下来的平均策略采样。
+- `train` 使用 `TRAIN_NUM_ROUNDS`，`val/test` 使用 `INFER_NUM_ROUNDS`。
 
 ## 6. phase 与 latest answer
 
