@@ -53,8 +53,9 @@ class GSPOAgentPolicy:
         # 我们额外解冻最后若干层 decoder block 和最终 norm，
         # 让 Phi-3 有足够的表示能力去适应 GSPO 更新。
         self.trainable_params = self._configure_trainable_params()
-        # last_update 用来把“本轮 GSPO 采样到的最佳候选”传回 run_all.py，
-        # 这样实验主流程里拼接进上下文的，就是刚刚被 GSPO 评估过的那条输出。
+        # last_update 只做诊断记录。
+        # 这里的 selected_text 仅对应“batch 采样路径里真正执行的那个候选”，
+        # 不会因为组内 best_text 更高分就替换掉本轮真实执行结果。
         self.last_update = None
         
         # 论文GSPO核心超参
@@ -294,8 +295,9 @@ class GSPOAgentPolicy:
         """
         延迟奖励版本的第一步：只负责采样候选，不立刻更新参数。
 
-        selected_idx 表示这次真实轨迹里采用哪一个候选。
-        目前默认使用第一个采样结果，等价于“从当前策略真实采样一条轨迹”。
+        selected_idx 只在“训练 / batch 采样”路径里有意义，
+        表示这次真实训练分支采用哪一个候选。
+        验证/测试阶段不走这里，而是直接调用 sample_text 做单次采样。
         """
         candidates = self.act(query_context, prompt_override=prompt_override)
         if not candidates:
@@ -311,6 +313,7 @@ class GSPOAgentPolicy:
         }
         self.last_update = {
             "selected_text": batch["selected_text"],
+            # best_text 仅用于诊断或日志，不参与真实轨迹上的 incumbent 更新。
             "best_text": batch["selected_text"],
             "candidates": [cand["text"] for cand in candidates],
             "rewards": None,
@@ -319,7 +322,13 @@ class GSPOAgentPolicy:
 
     def sample_text(self, query_context, prompt_override=None):
         """
-        只采样一条文本，主要用于反事实 reroll，不参与 GSPO 参数更新。
+        只采样一条文本。
+
+        用途：
+        - 验证/测试阶段的真实单轨迹执行
+        - 反事实 reroll
+
+        它不构造候选 batch，也不参与 GSPO 参数更新。
         """
         # 反事实 rollout / 真实轨迹都应使用 eval 模式，
         # 避免把训练态 dropout 噪声混进策略行为。
@@ -375,6 +384,7 @@ class GSPOAgentPolicy:
                 self.last_update = {
                     "avg_reward": avg_reward,
                     "best_reward": rewards[best_idx],
+                    # 仅诊断：batch 路径里真正执行的仍是 selected_text。
                     "best_text": candidates[best_idx]["text"],
                     "selected_text": batch["selected_text"],
                     "selected_reward": rewards[batch["selected_idx"]],
@@ -406,6 +416,7 @@ class GSPOAgentPolicy:
                 self.last_update = {
                     "avg_reward": avg_reward,
                     "best_reward": rewards[best_idx],
+                    # 仅诊断：batch 路径里真正执行的仍是 selected_text。
                     "best_text": candidates[best_idx]["text"],
                     "selected_text": batch["selected_text"],
                     "selected_reward": rewards[batch["selected_idx"]],
@@ -423,6 +434,7 @@ class GSPOAgentPolicy:
             self.last_update = {
                 "avg_reward": avg_reward,
                 "best_reward": rewards[best_idx],
+                # 仅诊断：batch 路径里真正执行的仍是 selected_text。
                 "best_text": candidates[best_idx]["text"],
                 "selected_text": batch["selected_text"],
                 "selected_reward": rewards[batch["selected_idx"]],

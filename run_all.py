@@ -410,7 +410,7 @@ def compute_phase(prev_phase_value, rnd, eps=PHASE_Q_EPS):
 
     当前规则：
     - 第 1 轮固定为 search
-    - 从第 2 轮开始，看上一轮该真实分支自己的单个 realized middle value
+    - 从第 2 轮开始，看上一轮该真实分支自己的单个 phase 更新信号
     - 若该值 > eps，则继续 search
     - 否则进入 stabilize
     """
@@ -420,6 +420,48 @@ def compute_phase(prev_phase_value, rnd, eps=PHASE_Q_EPS):
     phase_score = float(prev_phase_value)
     phase = "search" if phase_score > eps else "stabilize"
     return phase, phase_score
+
+def same_numeric_prediction(pred_a, pred_b, tol=1e-9):
+    if pred_a is None or pred_b is None:
+        return False
+    return abs(float(pred_a) - float(pred_b)) < tol
+
+def compute_phase_update_signal(
+    act,
+    current_pred=None,
+    incumbent_pred=None,
+):
+    """
+    训练/推理统一使用的无标签 phase 更新信号。
+
+    目标：
+    - train / val / test 共用同一套 phase 转移规则
+    - phase 只依赖真实轨迹当前可观测到的动作和答案变化
+    - 不再把 reward/value 或 ground-truth 喂回后续轮次
+
+    规则：
+    - silent: 0.0，表示本轮没有引入新信息，下一轮偏 stabilize
+    - comment: 1.0，表示仍在探索，下一轮进入 search
+    - answer:
+      - 若当前 answer 不可解析，记 1.0，表示问题仍未稳定
+      - 若这是第一条可解析 answer，记 1.0
+      - 若与上一轮 incumbent 数值答案相同，记 0.0
+      - 若给出了不同于 incumbent 的新答案，记 1.0
+
+    因而 phase 实际上是一个“轨迹是否发生实质变化”的二值状态机。
+    """
+    if act == MIDDLE_ACTION_SILENT:
+        return 0.0
+    if act == MIDDLE_ACTION_COMMENT:
+        return 1.0
+
+    if current_pred is None:
+        return 1.0
+    if incumbent_pred is None:
+        return 1.0
+    if same_numeric_prediction(current_pred, incumbent_pred):
+        return 0.0
+    return 1.0
 
 def build_outer_state(phase):
     return (
@@ -487,15 +529,6 @@ def get_middle_allowed_actions(rnd, incumbent_pred, allow_silent=True, total_rou
         MIDDLE_ACTION_ANSWER,
     ]
 
-def set_sampled_batch_selected_candidate(agent, batch, selected_idx):
-    selected_idx = max(0, min(int(selected_idx), len(batch["candidates"]) - 1))
-    batch["selected_idx"] = selected_idx
-    batch["selected_text"] = batch["candidates"][selected_idx]["text"]
-    if getattr(agent, "last_update", None) is not None:
-        agent.last_update["selected_text"] = batch["selected_text"]
-        agent.last_update["best_text"] = batch["selected_text"]
-    return selected_idx
-
 def classify_round_transition(previous_pred, current_pred, gt):
     previous_reward = reward_from_pred(previous_pred, gt)
     current_reward = reward_from_pred(current_pred, gt)
@@ -519,19 +552,6 @@ def classify_round_transition(previous_pred, current_pred, gt):
         "stalled_wrong": stalled_wrong,
         "preserved_correct": preserved_correct,
     }
-
-def get_updated_agent_text(agent):
-    if getattr(agent, "last_update", None) and agent.last_update.get("best_text") is not None:
-        return agent.last_update["best_text"]
-    raise RuntimeError("GSPO 更新后未记录候选输出，无法将本轮结果拼接进上下文。")
-
-def get_selected_agent_text(agent):
-    if getattr(agent, "last_update", None):
-        if agent.last_update.get("selected_text") is not None:
-            return agent.last_update["selected_text"]
-        if agent.last_update.get("best_text") is not None:
-            return agent.last_update["best_text"]
-    raise RuntimeError("GSPO 采样后未记录本轮选中的输出，无法拼接进上下文。")
 
 def get_single_gspo_round_prompt(rnd):
     """
@@ -736,6 +756,7 @@ def sample_gspo_step(
     Python 语法说明：
     - dict 就是 {键: 值, 键: 值, ...}
     - 后面可以通过 step["selected_text"] 这种写法取字段
+    - 这个 helper 对应训练 / batch 采样路径；验证/测试单轨迹请用 sample_single_text_step
     """
     ctx = build_context(question, history)
     batch = agent.sample_candidates(ctx, prompt_override=prompt_override)
@@ -750,6 +771,39 @@ def sample_gspo_step(
         "prompt_override": prompt_override,
         "total_rounds": total_rounds,
         "batch": batch,
+        "selected_text": selected_text,
+    }
+
+def sample_single_text_step(
+    agent,
+    question,
+    history,
+    rnd,
+    speaker,
+    kind,
+    prompt_override=None,
+    total_rounds=None,
+):
+    """
+    评估阶段的单轨迹采样。
+
+    与 sample_gspo_step 的区别：
+    - 不构造候选 batch
+    - 不存在 selected_idx
+    - 真实轨迹就是这次单次采样得到的文本
+    """
+    ctx = build_context(question, history)
+    selected_text = agent.sample_text(ctx, prompt_override=prompt_override)
+    return {
+        "agent": agent,
+        "question": question,
+        "pre_history": history,
+        "round": rnd,
+        "speaker": speaker,
+        "kind": kind,
+        "prompt_override": prompt_override,
+        "total_rounds": total_rounds,
+        "batch": None,
         "selected_text": selected_text,
     }
 
@@ -1063,7 +1117,7 @@ def sample_counterfactual_policy_batch(agent, question, history, prompt_override
     """
     只读反事实采样：
     - 不写 agent.last_update
-    - 不污染真实轨迹这一步已经记录的 selected_text / best_text
+    - 不污染真实轨迹这一步已经记录的 selected_text
     """
     query_context = build_context(question, history)
     candidates = agent.act(query_context, prompt_override=prompt_override)
@@ -1448,7 +1502,9 @@ def init_three_layer_sample_state():
       当前最新一次 answer 的文本和数字答案；如果后续轮次 comment/silent，
       它只作为 latest_answer fallback 被沿用
     - prev_phase_value:
-      上一轮该真实分支自己的单个 realized middle value，用于下一轮 phase 判断
+      上一轮用于决定下一轮 phase 的信号。
+      train / val / test 统一使用无标签“轨迹变化”信号，
+      避免 reward/value 或 ground-truth 泄露到后续决策。
     - best_correct:
       这条样本是否历史上曾经答对过，用来算 best-so-far
     - first_*:
@@ -1477,7 +1533,9 @@ def clone_branch_state_with_outcome(parent_state, outcome, gt, rnd):
         "incumbent_text": outcome["incumbent_text"],
         "incumbent_pred": outcome["incumbent_pred"],
         "incumbent_reward": reward_from_pred(outcome["incumbent_pred"], gt),
-        "prev_phase_value": float(outcome["realized_value"]),
+        "prev_phase_value": float(
+            outcome.get("phase_update_signal", outcome["realized_value"])
+        ),
         "best_correct": parent_state["best_correct"] or bool(
             compute_accuracy([outcome["incumbent_pred"]], [gt])
         ),
@@ -1496,7 +1554,9 @@ def clone_branch_state_with_outcome(parent_state, outcome, gt, rnd):
 def materialize_round_children(parent_state, round_result, gt, rnd, expand_all):
     outcomes = round_result["candidate_outcomes"]
     if not expand_all:
-        outcomes = outcomes[:1]
+        selected_outcome_idx = int(round_result.get("selected_outcome_idx", 0))
+        selected_outcome_idx = max(0, min(selected_outcome_idx, len(outcomes) - 1))
+        outcomes = [outcomes[selected_outcome_idx]] if outcomes else []
 
     children = []
     for outcome in outcomes:
@@ -1523,6 +1583,7 @@ def run_three_layer_realized_action(
     pre_history,
     pre_incumbent_text,
     pre_incumbent_pred,
+    use_candidate_batch=True,
     total_rounds=NUM_ROUNDS,
 ):
     """
@@ -1537,6 +1598,8 @@ def run_three_layer_realized_action(
       这一轮执行完后的新历史
     - realized_value:
       中层 / 内层学习用的动作价值
+    - phase_update_signal:
+      下一轮 phase 使用的无标签状态转移信号。
     - gspo_update_payload:
       给内层 GSPO policy 做更新时需要的缓存批次和 reward
 
@@ -1553,6 +1616,8 @@ def run_three_layer_realized_action(
     incumbent_pred = pre_incumbent_pred
     incumbent_reward = reward_from_pred(incumbent_pred, gt)
     silent_baseline = None
+    phase_update_signal = 0.0
+    selected_outcome_idx = 0
 
     if act == MIDDLE_ACTION_SILENT:
         realized_middle_value = estimate_policy_stack_silent_value(
@@ -1570,6 +1635,7 @@ def run_three_layer_realized_action(
             "pi2 选择不发言，本轮不修改 incumbent。",
             "silent",
         )
+        phase_update_signal = compute_phase_update_signal(MIDDLE_ACTION_SILENT)
         candidate_middle_values = [realized_middle_value]
         candidate_outcomes = [{
             "history": history,
@@ -1577,6 +1643,7 @@ def run_three_layer_realized_action(
             "incumbent_pred": incumbent_pred,
             "current_pred": None,
             "realized_value": realized_middle_value,
+            "phase_update_signal": phase_update_signal,
         }]
     elif act == MIDDLE_ACTION_COMMENT:
         silent_baseline = estimate_middle_silent_baseline(
@@ -1588,33 +1655,67 @@ def run_three_layer_realized_action(
             gt,
             total_rounds=total_rounds,
         )
-        step = sample_gspo_step(
-            agents[selected_agent]["pi0"],
-            question,
-            pre_history,
-            rnd,
-            f"agent{selected_agent}_pi0",
-            "comment",
-            prompt_override=PI0_PROMPT,
-            total_rounds=total_rounds,
+        if use_candidate_batch:
+            step = sample_gspo_step(
+                agents[selected_agent]["pi0"],
+                question,
+                pre_history,
+                rnd,
+                f"agent{selected_agent}_pi0",
+                "comment",
+                prompt_override=PI0_PROMPT,
+                total_rounds=total_rounds,
+            )
+            comment_rewards = compute_policy_stack_comment_candidate_rewards(
+                step,
+                agents[selected_agent],
+                pre_incumbent_pred,
+                gt,
+                silent_baseline=silent_baseline,
+            )
+            gspo_update_payload = (
+                step["agent"],
+                step["batch"],
+                comment_rewards,
+            )
+            candidate_middle_values = [float(v) for v in comment_rewards]
+            selected_idx = int(step["batch"].get("selected_idx", 0))
+            if comment_rewards:
+                selected_idx = max(0, min(selected_idx, len(comment_rewards) - 1))
+                realized_middle_value = comment_rewards[selected_idx]
+            selected_outcome_idx = selected_idx
+        else:
+            step = sample_single_text_step(
+                agents[selected_agent]["pi0"],
+                question,
+                pre_history,
+                rnd,
+                f"agent{selected_agent}_pi0",
+                "comment",
+                prompt_override=PI0_PROMPT,
+                total_rounds=total_rounds,
+            )
+            realized_middle_value = float(
+                estimate_policy_stack_comment_value(
+                    agents[selected_agent],
+                    question,
+                    pre_history,
+                    rnd,
+                    pre_incumbent_pred,
+                    gt,
+                    comment_text=step["selected_text"],
+                    speaker=step["speaker"],
+                    silent_baseline=silent_baseline,
+                    total_rounds=total_rounds,
+                )
+            )
+            candidate_middle_values = [realized_middle_value]
+            selected_outcome_idx = 0
+        phase_update_signal = compute_phase_update_signal(
+            MIDDLE_ACTION_COMMENT,
+            current_pred=None,
+            incumbent_pred=pre_incumbent_pred,
         )
-        comment_rewards = compute_policy_stack_comment_candidate_rewards(
-            step,
-            agents[selected_agent],
-            pre_incumbent_pred,
-            gt,
-            silent_baseline=silent_baseline,
-        )
-        gspo_update_payload = (
-            step["agent"],
-            step["batch"],
-            comment_rewards,
-        )
-        candidate_middle_values = [float(v) for v in comment_rewards]
-        selected_idx = int(step["batch"].get("selected_idx", 0))
-        if comment_rewards:
-            selected_idx = max(0, min(selected_idx, len(comment_rewards) - 1))
-            realized_middle_value = comment_rewards[selected_idx]
         history = append_round_output(
             history,
             rnd,
@@ -1622,19 +1723,30 @@ def run_three_layer_realized_action(
             step["selected_text"],
             "comment",
         )
-        for cand, cand_value in zip(step["batch"]["candidates"], candidate_middle_values):
+        if use_candidate_batch:
+            for cand, cand_value in zip(step["batch"]["candidates"], candidate_middle_values):
+                candidate_outcomes.append({
+                    "history": append_round_output(
+                        pre_history,
+                        rnd,
+                        f"agent{selected_agent}_pi0",
+                        cand["text"],
+                        "comment",
+                    ),
+                    "incumbent_text": pre_incumbent_text,
+                    "incumbent_pred": pre_incumbent_pred,
+                    "current_pred": None,
+                    "realized_value": cand_value,
+                    "phase_update_signal": phase_update_signal,
+                })
+        else:
             candidate_outcomes.append({
-                "history": append_round_output(
-                    pre_history,
-                    rnd,
-                    f"agent{selected_agent}_pi0",
-                    cand["text"],
-                    "comment",
-                ),
+                "history": history,
                 "incumbent_text": pre_incumbent_text,
                 "incumbent_pred": pre_incumbent_pred,
                 "current_pred": None,
-                "realized_value": cand_value,
+                "realized_value": realized_middle_value,
+                "phase_update_signal": phase_update_signal,
             })
     else:
         silent_baseline = estimate_middle_silent_baseline(
@@ -1646,36 +1758,60 @@ def run_three_layer_realized_action(
             gt,
             total_rounds=total_rounds,
         )
-        step = sample_gspo_step(
-            agents[selected_agent]["pi1"],
-            question,
-            pre_history,
-            rnd,
-            f"agent{selected_agent}_pi1",
-            "answer",
-            prompt_override=PI1_PROMPT,
-            total_rounds=total_rounds,
+        if use_candidate_batch:
+            step = sample_gspo_step(
+                agents[selected_agent]["pi1"],
+                question,
+                pre_history,
+                rnd,
+                f"agent{selected_agent}_pi1",
+                "answer",
+                prompt_override=PI1_PROMPT,
+                total_rounds=total_rounds,
+            )
+            answer_rewards = compute_answer_candidate_rewards(
+                step["batch"],
+                gt,
+            )
+            gspo_update_payload = (
+                step["agent"],
+                step["batch"],
+                answer_rewards,
+            )
+            middle_answer_values = compute_centered_answer_candidate_values(
+                step["batch"],
+                gt,
+                silent_baseline,
+            )
+            candidate_middle_values = [float(v) for v in middle_answer_values]
+            selected_idx = int(step["batch"].get("selected_idx", 0))
+            if middle_answer_values:
+                selected_idx = max(0, min(selected_idx, len(middle_answer_values) - 1))
+                realized_middle_value = middle_answer_values[selected_idx]
+            current_pred = extract_pred_num(step["selected_text"])
+            selected_outcome_idx = selected_idx
+        else:
+            step = sample_single_text_step(
+                agents[selected_agent]["pi1"],
+                question,
+                pre_history,
+                rnd,
+                f"agent{selected_agent}_pi1",
+                "answer",
+                prompt_override=PI1_PROMPT,
+                total_rounds=total_rounds,
+            )
+            current_pred = extract_pred_num(step["selected_text"])
+            realized_middle_value = float(
+                reward_from_pred(current_pred, gt) - silent_baseline
+            )
+            candidate_middle_values = [realized_middle_value]
+            selected_outcome_idx = 0
+        phase_update_signal = compute_phase_update_signal(
+            MIDDLE_ACTION_ANSWER,
+            current_pred=current_pred,
+            incumbent_pred=pre_incumbent_pred,
         )
-        answer_rewards = compute_answer_candidate_rewards(
-            step["batch"],
-            gt,
-        )
-        gspo_update_payload = (
-            step["agent"],
-            step["batch"],
-            answer_rewards,
-        )
-        middle_answer_values = compute_centered_answer_candidate_values(
-            step["batch"],
-            gt,
-            silent_baseline,
-        )
-        candidate_middle_values = [float(v) for v in middle_answer_values]
-        selected_idx = int(step["batch"].get("selected_idx", 0))
-        if middle_answer_values:
-            selected_idx = max(0, min(selected_idx, len(middle_answer_values) - 1))
-            realized_middle_value = middle_answer_values[selected_idx]
-        current_pred = extract_pred_num(step["selected_text"])
         incumbent_text = step["selected_text"]
         incumbent_pred = current_pred
         incumbent_reward = reward_from_pred(incumbent_pred, gt)
@@ -1686,20 +1822,35 @@ def run_three_layer_realized_action(
             step["selected_text"],
             "answer",
         )
-        for cand, cand_value in zip(step["batch"]["candidates"], candidate_middle_values):
-            cand_pred = extract_pred_num(cand["text"])
+        if use_candidate_batch:
+            for cand, cand_value in zip(step["batch"]["candidates"], candidate_middle_values):
+                cand_pred = extract_pred_num(cand["text"])
+                candidate_outcomes.append({
+                    "history": append_round_output(
+                        pre_history,
+                        rnd,
+                        f"agent{selected_agent}_pi1",
+                        cand["text"],
+                        "answer",
+                    ),
+                    "incumbent_text": cand["text"],
+                    "incumbent_pred": cand_pred,
+                    "current_pred": cand_pred,
+                    "realized_value": cand_value,
+                    "phase_update_signal": compute_phase_update_signal(
+                        MIDDLE_ACTION_ANSWER,
+                        current_pred=cand_pred,
+                        incumbent_pred=pre_incumbent_pred,
+                    ),
+                })
+        else:
             candidate_outcomes.append({
-                "history": append_round_output(
-                    pre_history,
-                    rnd,
-                    f"agent{selected_agent}_pi1",
-                    cand["text"],
-                    "answer",
-                ),
-                "incumbent_text": cand["text"],
-                "incumbent_pred": cand_pred,
-                "current_pred": cand_pred,
-                "realized_value": cand_value,
+                "history": history,
+                "incumbent_text": incumbent_text,
+                "incumbent_pred": incumbent_pred,
+                "current_pred": current_pred,
+                "realized_value": realized_middle_value,
+                "phase_update_signal": phase_update_signal,
             })
     return {
         "history": history,
@@ -1708,8 +1859,10 @@ def run_three_layer_realized_action(
         "incumbent_reward": incumbent_reward,
         "current_pred": current_pred,
         "realized_value": realized_middle_value,
+        "phase_update_signal": phase_update_signal,
         "candidate_middle_values": candidate_middle_values,
         "candidate_outcomes": candidate_outcomes,
+        "selected_outcome_idx": selected_outcome_idx,
         "step": step,
         "gspo_update_payload": gspo_update_payload,
     }
@@ -2198,11 +2351,11 @@ def run_single_gspo(
     实验3：单智能体 GSPO。
 
     这个实验最容易误解的地方是：
-    - 它训练时会采样多个候选
-    - 但真实轨迹推进时，仍然只使用 selected_text 这一条
+    - 训练时会采样多个候选，并用整批 candidates 做 GSPO 更新
+    - 验证/测试时不再伪造 batch，真实轨迹就是每轮单次采样出来的那一条文本
 
     所以它不是“best-of-G 测试时重排”，
-    而是“单次真实动作 + 组内候选训练更新”。
+    而是“训练用组内候选更新，推理时单次真实采样”。
     """
     print(f"\n=== 开始运行{exp_name}实验 ===")
     if agent is None:
@@ -2224,19 +2377,29 @@ def run_single_gspo(
             prompt = get_single_gspo_round_prompt(rnd)
             is_answer_round = (rnd % 2 == 1)
             speaker = "single_gspo_answer" if is_answer_round else "single_gspo_comment"
-            step = sample_gspo_step(
-                agent,
-                q,
-                history,
-                rnd,
-                speaker,
-                "answer" if is_answer_round else "comment",
-                prompt_override=prompt,
-                total_rounds=num_rounds,
-            )
+            if update_params:
+                step = sample_gspo_step(
+                    agent,
+                    q,
+                    history,
+                    rnd,
+                    speaker,
+                    "answer" if is_answer_round else "comment",
+                    prompt_override=prompt,
+                    total_rounds=num_rounds,
+                )
+            else:
+                step = sample_single_text_step(
+                    agent,
+                    q,
+                    history,
+                    rnd,
+                    speaker,
+                    "answer" if is_answer_round else "comment",
+                    prompt_override=prompt,
+                    total_rounds=num_rounds,
+                )
             res = step["selected_text"]
-            # 这里明确使用 selected_text，而不是 best_text。
-            # 这保证了和 baseline 的“单次真实采样”比较是公平的。
             current_pred = extract_pred_num(res)
             last_pred = update_last_pred(last_pred, current_pred, is_answer_round)
             history = append_round_output(
@@ -2304,6 +2467,7 @@ def run_dual_gspo(
     - 角色顺序仍然一样
     - 但 solver / commenter 都不再是固定推理模型
     - 而是各自带一个会在线更新的 GSPO policy
+    - 训练时使用候选 batch 更新；验证/测试时每轮只真实采样 1 条文本
     """
     print(f"\n=== 开始运行{exp_name}实验 ===")
     if solver is None:
@@ -2326,30 +2490,54 @@ def run_dual_gspo(
         for rnd in range(1, num_rounds + 1):
             role = get_round_role(rnd)
             if role == "solver":
-                step = sample_gspo_step(
-                    solver,
-                    q,
-                    history,
-                    rnd,
-                    role,
-                    "answer",
-                    prompt_override=SOLVER_PROMPT,
-                    total_rounds=num_rounds,
-                )
+                if update_params:
+                    step = sample_gspo_step(
+                        solver,
+                        q,
+                        history,
+                        rnd,
+                        role,
+                        "answer",
+                        prompt_override=SOLVER_PROMPT,
+                        total_rounds=num_rounds,
+                    )
+                else:
+                    step = sample_single_text_step(
+                        solver,
+                        q,
+                        history,
+                        rnd,
+                        role,
+                        "answer",
+                        prompt_override=SOLVER_PROMPT,
+                        total_rounds=num_rounds,
+                    )
                 res = step["selected_text"]
                 current_pred = extract_pred_num(res)
                 last_pred = update_last_pred(last_pred, current_pred, True)
             else:
-                step = sample_gspo_step(
-                    commenter,
-                    q,
-                    history,
-                    rnd,
-                    role,
-                    "comment",
-                    prompt_override=COMMENTER_PROMPT,
-                    total_rounds=num_rounds,
-                )
+                if update_params:
+                    step = sample_gspo_step(
+                        commenter,
+                        q,
+                        history,
+                        rnd,
+                        role,
+                        "comment",
+                        prompt_override=COMMENTER_PROMPT,
+                        total_rounds=num_rounds,
+                    )
+                else:
+                    step = sample_single_text_step(
+                        commenter,
+                        q,
+                        history,
+                        rnd,
+                        role,
+                        "comment",
+                        prompt_override=COMMENTER_PROMPT,
+                        total_rounds=num_rounds,
+                    )
                 res = step["selected_text"]
 
             history = append_round_output(
@@ -2464,6 +2652,7 @@ def run_policy_stack_experiment(
             round_start_time = time.perf_counter()
             next_branches = []
             representative_meta = None
+            round_records = []
 
             for branch_idx, branch_state in enumerate(active_branches):
                 pre_history = branch_state["history"]
@@ -2510,6 +2699,7 @@ def run_policy_stack_experiment(
                     pre_history,
                     pre_incumbent_text,
                     pre_incumbent_pred,
+                    use_candidate_batch=update_params,
                     total_rounds=num_rounds,
                 )
                 if branch_idx == 0:
@@ -2561,6 +2751,16 @@ def run_policy_stack_experiment(
                     expand_all=update_params,
                 )
                 next_branches.extend(child["state"] for child in branch_children)
+                for child in branch_children:
+                    round_records.append({
+                        "incumbent_pred": child["state"]["incumbent_pred"],
+                        "best_correct": child["state"]["best_correct"],
+                        "realized_value": child["outcome"]["realized_value"],
+                        "outer_strategy": np.array(outer_strategy, copy=True),
+                        "middle_strategy": np.array(middle_strategy, copy=True),
+                        "phase": phase,
+                        "transition": child["transition"],
+                    })
 
                 if representative_meta is None and branch_children:
                     representative_meta = {
@@ -2578,20 +2778,21 @@ def run_policy_stack_experiment(
 
             active_branches = next_branches
             representative_state = representative_meta["state"]
-            record_three_layer_round(
-                buffers,
-                rnd,
-                gt,
-                representative_state["incumbent_pred"],
-                representative_state["best_correct"],
-                representative_meta["realized_value"],
-                outer_cfr,
-                middle_cfr,
-                representative_meta["outer_strategy"],
-                representative_meta["middle_strategy"],
-                representative_meta["phase"],
-                representative_meta["transition"],
-            )
+            for round_record in round_records:
+                record_three_layer_round(
+                    buffers,
+                    rnd,
+                    gt,
+                    round_record["incumbent_pred"],
+                    round_record["best_correct"],
+                    round_record["realized_value"],
+                    outer_cfr,
+                    middle_cfr,
+                    round_record["outer_strategy"],
+                    round_record["middle_strategy"],
+                    round_record["phase"],
+                    round_record["transition"],
+                )
             maybe_print_three_layer_round_debug(
                 idx,
                 rnd,

@@ -43,6 +43,8 @@
 - 无论训练还是 `val/test`，准确率都使用最近一次真正产生的 answer
 - comment / silent 轮没有新 answer 时，才沿用上一条 answer
 - 如果最新 answer 不可解析，也按这次最新 answer 记分，不回退到更早的旧答案
+- 训练阶段的轮次统计按本轮展开后的全部真实训练分支聚合
+- `val/test` 的轮次统计按单条真实采样轨迹聚合
 
 ### 3.2 需要训练的实验
 
@@ -146,15 +148,15 @@
 
 1. `pi1` 先采样一批 answer 候选。
 2. 训练阶段，这一批 candidates 会展开成多条真实训练分支。
-3. 验证/测试阶段，真实轨迹继续使用该 batch 的 `selected_text`。
-4. 当前实现里 `selected_idx` 默认就是第一个候选。
-5. answer 一旦被执行，就直接更新 latest answer；后续 comment / silent 轮次只把它当作 fallback 沿用。
+3. 验证/测试阶段，不再沿用该 batch；真实轨迹每轮直接单次采样 1 条文本。
+4. answer 一旦被执行，就直接更新 latest answer；后续 comment / silent 轮次只把它当作 fallback 沿用。
+5. `incumbent` 始终表示最近一次真实执行的 answer，即该轨迹刚刚真实采样出的 answer / `current_pred`，不表示 batch 内的最高分候选。
 
 这意味着：
 
 - 内层 GSPO 始终使用整批 candidates 更新。
 - `train` 时，中层/外层也把这批 candidates 展开成多条真实训练分支。
-- `val/test` 时，不展开多分支，只沿 `selected_text` 做单路径评估。
+- `val/test` 时，不展开多分支；每轮直接单次采样 1 条真实文本做单路径评估。
 - `train` 时，外层/中层动作按当前 regret-matching 策略采样。
 - `val/test` 时，外层/中层动作按训练全过程累计下来的平均策略采样。
 - `train` 使用 `TRAIN_NUM_ROUNDS`，`val/test` 使用 `INFER_NUM_ROUNDS`。
@@ -162,7 +164,10 @@
 ## 6. phase 与 latest answer
 
 - 第 1 轮固定 `phase = search`。
-- 从第 2 轮开始，若上一轮该真实分支自己的单个 realized middle value 大于 `PHASE_Q_EPS`，则本轮 `phase = search`。
+- 从第 2 轮开始，若上一轮该真实分支自己的单个 phase 更新信号大于 `PHASE_Q_EPS`，则本轮 `phase = search`。
+- 该信号在 `train / val / test` 三个阶段统一定义为无标签“轨迹变化”信号。
+- `comment` 或新/不可解析 `answer` 记为 `1.0`。
+- `silent` 或重复 incumbent 的 `answer` 记为 `0.0`。
 - 否则本轮 `phase = stabilize`。
 - 当前默认 `PHASE_Q_EPS = 0.05`。
 - `incumbent` 变量现在只表示 latest answer，不再表示 verifier 审批后的 incumbent。
@@ -253,7 +258,7 @@
 ### 8.3 search 约束
 
 - `search / stabilize` phase 仍然保留，用于构造中层/外层状态
-- phase 的切换只看上一轮该真实分支自己的单个 realized middle value，不再依赖 verifier
+- `train / val / test` 时 phase 的切换都看同一个无标签“轨迹变化”信号
 - 当前中层动作采样已退化为 raw regret-matching，不再额外使用旧的 search 概率 floor / cap 约束
 - 相关旧配置仍保留在 `src/config.py`，便于回溯旧实验
 
@@ -338,8 +343,7 @@ timeout 120s conda run --no-capture-output -n lcs python -u run_staged_isolated.
 
 - 已直接验证共享策略栈的 answer 推进逻辑：
   - 训练时真实 batch 会展开成多条训练分支
-  - 评估时真实轨迹默认使用该 batch 的 `selected_text`
-  - `selected_idx` 默认保持为 `0`
+  - 评估时真实轨迹每轮直接单次采样 1 条文本
   - answer 执行后会直接更新 latest answer
 
 当前限制：

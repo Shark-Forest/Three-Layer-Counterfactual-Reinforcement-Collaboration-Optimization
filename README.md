@@ -20,6 +20,14 @@
 
 默认两者保持一致；当前默认值都是 `5`。
 
+当前还有一个非常关键的轨迹语义约束：
+
+- `train` 时会展开多条真实训练轨迹；同一轮产生的不同候选会变成不同训练分支
+- 每条训练分支都各自维护自己的 `history / incumbent / prev_phase_value`
+- `val/test` 时每个样本始终只有 1 条真实轨迹；每轮只直接采样 1 条文本
+- 因而 `val/test` 不存在 `selected_idx`，也不存在“从候选 batch 中再选一条代表真实轨迹”的过程
+- `incumbent` 始终只表示“这条真实轨迹最近一次 answer”，不是 batch 内所谓最佳答案
+
 ## 2. 八组实验
 
 当前主流程一共运行 8 组实验：
@@ -58,7 +66,8 @@
    - 外层：调度哪个 agent
    - 中层：选 `silent / comment / answer`
    - 内层：生成 comment 或 answer 文本
-   `phase` 由上一轮该真实分支自己的单个 realized middle value 决定，answer 直接更新 latest answer。
+   `phase` 统一由上一轮真实轨迹是否发生“实质变化”决定：
+   `comment` 或新/不可解析 `answer` 进入 `search`，`silent` 或重复 incumbent 的 `answer` 进入 `stabilize`。answer 直接更新 latest answer。
 
 8. `全量策略（中层无沉默）`
    与 `全量策略` 相同，但中层动作空间中移除 `silent`，只允许：
@@ -84,7 +93,7 @@
 当前 `phase` 规则很简单：
 
 - 第 1 轮固定 `search`
-- 从第 2 轮开始，若上一轮该真实分支自己的单个 realized middle value 大于 `0.05`，则继续 `search`
+- 从第 2 轮开始，若上一轮该真实分支自己的单个 phase 更新信号大于 `0.05`，则继续 `search`
 - 否则进入 `stabilize`
 
 在 `中间层策略+GSPO` 和 `中间层策略+GSPO（无沉默）` 中，这一层被移除；
@@ -133,23 +142,27 @@
 - `pi0`：comment policy
 - `pi1`：answer policy
 
-训练算法为 GSPO。它对同一上下文采样多个候选，在组内依据 reward/value 更新策略。
+训练算法为 GSPO。训练时它对同一上下文采样多个候选，在组内依据 reward/value 更新策略。
 
 对共享策略栈路径（`中间层策略+GSPO`、`中间层策略+GSPO（无沉默）`、`全量策略`、`全量策略（中层无沉默）`）而言，
 `pi1(answer)` 进入真实轨迹的规则现在统一为：
 
 - 先采样一批 answer 候选
 - 训练时，这一批 candidates 会展开成多条真实训练分支
-- 验证/测试时，真实轨迹继续使用该 batch 的 `selected_text`
-- 当前实现里 `selected_idx` 默认就是第一个候选
+- 验证/测试时，不再复用这批候选；真实轨迹改为直接单次采样 1 条 answer 文本
+- `incumbent` 始终等于最近一次真实执行的 answer，也就是该轨迹刚刚真实采样出的 answer / `current_pred`
+- 它不等于 batch 内 reward 最高的候选；后者若被记录，也只用于诊断
 
 也就是说，这几条共享策略栈实验里：
 
 - 内层 GSPO 一直用整批 candidates 更新
 - 训练阶段的中层/外层也会把这批 candidates 展开成多条真实训练分支
-- 验证/测试阶段仍保留单分支真实轨迹，用于可控评估
+- 验证/测试阶段始终只有 1 条真实轨迹；每轮直接采样 1 条文本，不存在 `selected_idx`
 
-`单LLM GSPO` 和 `双LLM GSPO轮询` 也默认使用该次采样 batch 的第一个候选推进真实轨迹。
+`单LLM GSPO` 和 `双LLM GSPO轮询` 也采用同样口径：
+
+- 训练时采样候选 batch 做 GSPO 更新
+- 验证/测试时每轮只真实采样 1 条文本，不存在 `selected_idx`
 
 ## 4. phase 与 latest answer
 
@@ -159,7 +172,10 @@
 
 1. `phase`
    - 第 1 轮固定为 `search`
-   - 从第 2 轮开始，看上一轮该真实分支自己的单个 realized middle value
+   - 从第 2 轮开始，看上一轮该真实分支自己的单个 phase 更新信号
+   - `comment` 记为 `1.0`，表示继续 `search`
+   - 新/不可解析 `answer` 记为 `1.0`，表示继续 `search`
+   - `silent` 或重复 incumbent 的 `answer` 记为 `0.0`，表示转入 `stabilize`
    - 若该值大于 `0.05`，则本轮继续 `search`
    - 否则本轮为 `stabilize`
 
@@ -199,13 +215,13 @@ GSM8K 现在统一采用：
 2. `val` 上只验证，不更新
 3. `test` 上最终评估
 
-其中，共享策略栈路径在 `train / val / test` 三个阶段都共用同一套 batch 采样与 value 定义；差别在于：
+其中，共享策略栈路径在 `train / val / test` 三个阶段都共用同一套 `phase` / `incumbent` / value 语义；差别在于文本生成与分支展开方式：
 
 - `train` 会把真实 batch 展开成多条训练分支，并更新 CFR / GSPO
-- `val / test` 不更新参数，也不展开多分支，只沿 `selected_text` 单路径评估
+- `val / test` 不更新参数，也不展开多分支；每轮都直接单次采样 1 条真实文本，沿单轨迹评估
 - `train` 的外层/中层动作来自当前 regret-matching 策略
 - `val / test` 的外层/中层动作来自训练全过程累计得到的平均策略
-- 三个阶段的 `phase` 都使用“上一轮该真实分支自己的单个 realized middle value”
+- `train / val / test` 的 `phase` 都使用同一套无标签“轨迹变化”信号
 - 轮次数量也分开配置：`train` 用 `TRAIN_NUM_ROUNDS`，`val / test` 用 `INFER_NUM_ROUNDS`
 
 ### 5.3 哪些实验只做测试
@@ -223,6 +239,8 @@ GSM8K 现在统一采用：
 - 无论训练还是验证 / 测试，准确率始终使用“最近一次真正产生的 answer”
 - comment / silent 轮因为没有新 answer，才沿用上一条 answer
 - 如果新的 answer 不可解析，也按这次最新 answer 记分，不回退到更早的旧答案
+- 训练阶段的轮次统计按“本轮展开后的全部真实训练分支”聚合
+- 验证 / 测试阶段的轮次统计按单条真实采样轨迹聚合
 
 ## 6. 当前 reward / value 定义
 
@@ -315,7 +333,7 @@ GSM8K 现在统一采用：
 因此当前实现里：
 
 - 训练真实轨迹：comment / answer 每轮都会先产生一组 candidates，再展开成多条真实训练分支
-- 验证/测试真实轨迹：仍然只沿 `selected_text` 保留单分支
+- 验证/测试真实轨迹：每轮直接采样 1 条文本，只保留单分支，不存在 `selected_idx`
 - 虚拟 rollout：每条 comment 轨迹只继续产生 1 个 answer
 - 反事实动作价值：只采样 1 个 counterfactual batch，不再做 batch 均值外再套一层 batch 均值
 
@@ -596,6 +614,6 @@ git push -u origin main
 
 - 外层和中层用 CFR 学策略
 - 内层用 GSPO 学文本
-- `phase` 由上一轮该真实分支自己的单个 realized middle value 决定
+- `phase` 在三个阶段都使用同一套无标签“轨迹变化”规则
 - `latest_answer` 只负责在 comment / silent 轮次下做兜底
 - 现在统一支持 8 组实验、`train/val/test` 流程，以及针对 `comment / answer / silent` 的显式价值定义
