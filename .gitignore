@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Project outputs and caches
+data/
+models/
+logs/
+plots/
+runs/
+checkpoints/
+
+# Training / evaluation artifacts
+*.log
+*.out
+*.tmp
+*.pid
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Dataset / cache artifacts
+*.arrow
+*.parquet
+*.cache
+*.lock
+
+# Optional experiment tooling
+wandb/
+tensorboard/
+tb_logs/

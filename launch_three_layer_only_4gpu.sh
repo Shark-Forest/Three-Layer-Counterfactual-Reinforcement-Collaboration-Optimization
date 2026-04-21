@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAS_CONDA_ENV_PATH="${MAS_CONDA_ENV_PATH:-/root/miniconda3/envs/py312}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_DIR="${MAS_RUN_DIR:-${PROJECT_ROOT}/runs/three_layer_only_${RUN_STAMP}}"
+ENV_PYTHON="${MAS_CONDA_ENV_PATH}/bin/python"
+ITT_PRELOAD_SO="${MAS_ITT_PRELOAD_SO:-}"
+
+if [[ -z "${ITT_PRELOAD_SO}" ]]; then
+  if [[ -f "${MAS_CONDA_ENV_PATH}/lib/libittnotify.so" ]]; then
+    ITT_PRELOAD_SO="${MAS_CONDA_ENV_PATH}/lib/libittnotify.so"
+  elif [[ -f "${MAS_CONDA_ENV_PATH}/lib/libiomp5.so" ]]; then
+    ITT_PRELOAD_SO="${MAS_CONDA_ENV_PATH}/lib/libiomp5.so"
+  elif [[ -f "/root/miniconda3/pkgs/intel-openmp-2025.0.0-h06a4308_1171/lib/libiomp5.so" ]]; then
+    ITT_PRELOAD_SO="/root/miniconda3/pkgs/intel-openmp-2025.0.0-h06a4308_1171/lib/libiomp5.so"
+  fi
+fi
+
+mkdir -p "${RUN_DIR}"
+mkdir -p "${RUN_DIR}/logs"
+mkdir -p "${RUN_DIR}/plots"
+
+if [[ ! -x "${ENV_PYTHON}" ]]; then
+  echo "找不到 Python 环境: ${MAS_CONDA_ENV_PATH}" >&2
+  exit 1
+fi
+
+if [[ -n "${ITT_PRELOAD_SO}" && ! -f "${ITT_PRELOAD_SO}" ]]; then
+  echo "找不到 ITT 共享库: ${ITT_PRELOAD_SO}" >&2
+  exit 1
+fi
+
+PYTHONPATH_VALUE="${PROJECT_ROOT}"
+LANG_VALUE="${LANG:-C.UTF-8}"
+TERM_VALUE="${TERM:-xterm-256color}"
+PATH_VALUE="${MAS_CONDA_ENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PYTORCH_CUDA_ALLOC_CONF_VALUE="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+MAS_LOG_DIR_VALUE="${MAS_LOG_DIR:-${RUN_DIR}/logs}"
+MAS_PLOT_DIR_VALUE="${MAS_PLOT_DIR:-${RUN_DIR}/plots}"
+MAS_THREE_LAYER_DEBUG_PRINT_VALUE="${MAS_THREE_LAYER_DEBUG_PRINT:-0}"
+MAS_PARALLEL_MODE_VALUE="${MAS_PARALLEL_MODE:-three_layer_workers}"
+MAS_POLICY_DEVICE_MAP_VALUE="${MAS_POLICY_DEVICE_MAP:-agent0.pi0:0,agent0.pi1:1,agent1.pi0:2,agent1.pi1:3}"
+MAS_GLOBAL_SEED_VALUE="${MAS_GLOBAL_SEED:-1234}"
+
+echo "PROJECT_ROOT=${PROJECT_ROOT}"
+echo "MAS_CONDA_ENV_PATH=${MAS_CONDA_ENV_PATH}"
+echo "ENV_PYTHON=${ENV_PYTHON}"
+echo "ITT_PRELOAD_SO=${ITT_PRELOAD_SO:-<disabled>}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "RUN_DIR=${RUN_DIR}"
+echo "MAS_TRAIN_VAL_TOTAL_LIMIT=${MAS_TRAIN_VAL_TOTAL_LIMIT:-<full>}"
+echo "MAS_TEST_SAMPLE_LIMIT=${MAS_TEST_SAMPLE_LIMIT:-<full>}"
+echo "MAS_THREE_LAYER_DEBUG_PRINT=${MAS_THREE_LAYER_DEBUG_PRINT_VALUE}"
+echo "MAS_PARALLEL_MODE=${MAS_PARALLEL_MODE_VALUE}"
+echo "MAS_POLICY_DEVICE_MAP=${MAS_POLICY_DEVICE_MAP_VALUE}"
+echo "MAS_GLOBAL_SEED=${MAS_GLOBAL_SEED_VALUE}"
+echo "MAS_MODEL_SCOPE=${MAS_MODEL_SCOPE:-<default>}"
+echo "MAS_GSPO_FINETUNE_MODE=${MAS_GSPO_FINETUNE_MODE:-<default>}"
+echo "MAS_GSPO_TRAIN_DTYPE=${MAS_GSPO_TRAIN_DTYPE:-<default>}"
+echo "MAS_GSPO_LORA_R=${MAS_GSPO_LORA_R:-<default>}"
+echo "MAS_GSPO_LORA_ALPHA=${MAS_GSPO_LORA_ALPHA:-<default>}"
+echo "MAS_GSPO_LORA_DROPOUT=${MAS_GSPO_LORA_DROPOUT:-<default>}"
+echo "MAS_GSPO_LORA_BIAS=${MAS_GSPO_LORA_BIAS:-<default>}"
+echo "MAS_GSPO_LORA_TARGET_MODULES=${MAS_GSPO_LORA_TARGET_MODULES:-<default>}"
+echo "MAS_GSPO_NUM_CANDIDATES=${MAS_GSPO_NUM_CANDIDATES:-<default>}"
+echo "MAS_MAX_NEW_TOKENS=${MAS_MAX_NEW_TOKENS:-<default>}"
+echo "MAS_TRAIN_NUM_ROUNDS=${MAS_TRAIN_NUM_ROUNDS:-<default>}"
+echo "MAS_INFER_NUM_ROUNDS=${MAS_INFER_NUM_ROUNDS:-<default>}"
+echo "MAS_EXPAND_ALL_TRAIN_BRANCHES=${MAS_EXPAND_ALL_TRAIN_BRANCHES:-<default>}"
+echo "MAS_CHECKPOINT_DIR=${MAS_CHECKPOINT_DIR:-<default>}"
+echo "MAS_CHECKPOINT_EVERY_SAMPLES=${MAS_CHECKPOINT_EVERY_SAMPLES:-<default>}"
+echo "MAS_RESUME_CHECKPOINT=${MAS_RESUME_CHECKPOINT:-<default>}"
+
+CMD=(
+  env -i
+  "PATH=${PATH_VALUE}"
+  "HOME=${HOME:-/root}"
+  "LANG=${LANG_VALUE}"
+  "TERM=${TERM_VALUE}"
+  "PYTHONUNBUFFERED=1"
+  "PYTHONPATH=${PYTHONPATH_VALUE}"
+  "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+  "MAS_REQUIRE_CUDA=1"
+  "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF_VALUE}"
+  "MAS_LOG_DIR=${MAS_LOG_DIR_VALUE}"
+  "MAS_PLOT_DIR=${MAS_PLOT_DIR_VALUE}"
+  "MAS_THREE_LAYER_DEBUG_PRINT=${MAS_THREE_LAYER_DEBUG_PRINT_VALUE}"
+  "MAS_PARALLEL_MODE=${MAS_PARALLEL_MODE_VALUE}"
+  "MAS_POLICY_DEVICE_MAP=${MAS_POLICY_DEVICE_MAP_VALUE}"
+  "MAS_GLOBAL_SEED=${MAS_GLOBAL_SEED_VALUE}"
+)
+
+if [[ -n "${ITT_PRELOAD_SO}" ]]; then
+  CMD+=("LD_PRELOAD=${ITT_PRELOAD_SO}")
+fi
+
+if [[ -n "${MAS_TRAIN_VAL_TOTAL_LIMIT:-}" ]]; then
+  CMD+=("MAS_TRAIN_VAL_TOTAL_LIMIT=${MAS_TRAIN_VAL_TOTAL_LIMIT}")
+fi
+
+if [[ -n "${MAS_TEST_SAMPLE_LIMIT:-}" ]]; then
+  CMD+=("MAS_TEST_SAMPLE_LIMIT=${MAS_TEST_SAMPLE_LIMIT}")
+fi
+
+if [[ -n "${MAS_MODEL_SCOPE:-}" ]]; then
+  CMD+=("MAS_MODEL_SCOPE=${MAS_MODEL_SCOPE}")
+fi
+
+if [[ -n "${MAS_GSPO_FINETUNE_MODE:-}" ]]; then
+  CMD+=("MAS_GSPO_FINETUNE_MODE=${MAS_GSPO_FINETUNE_MODE}")
+fi
+
+if [[ -n "${MAS_GSPO_TRAIN_DTYPE:-}" ]]; then
+  CMD+=("MAS_GSPO_TRAIN_DTYPE=${MAS_GSPO_TRAIN_DTYPE}")
+fi
+
+if [[ -n "${MAS_GSPO_LORA_R:-}" ]]; then
+  CMD+=("MAS_GSPO_LORA_R=${MAS_GSPO_LORA_R}")
+fi
+
+if [[ -n "${MAS_GSPO_LORA_ALPHA:-}" ]]; then
+  CMD+=("MAS_GSPO_LORA_ALPHA=${MAS_GSPO_LORA_ALPHA}")
+fi
+
+if [[ -n "${MAS_GSPO_LORA_DROPOUT:-}" ]]; then
+  CMD+=("MAS_GSPO_LORA_DROPOUT=${MAS_GSPO_LORA_DROPOUT}")
+fi
+
+if [[ -n "${MAS_GSPO_LORA_BIAS:-}" ]]; then
+  CMD+=("MAS_GSPO_LORA_BIAS=${MAS_GSPO_LORA_BIAS}")
+fi
+
+if [[ -n "${MAS_GSPO_LORA_TARGET_MODULES:-}" ]]; then
+  CMD+=("MAS_GSPO_LORA_TARGET_MODULES=${MAS_GSPO_LORA_TARGET_MODULES}")
+fi
+
+if [[ -n "${MAS_GSPO_NUM_CANDIDATES:-}" ]]; then
+  CMD+=("MAS_GSPO_NUM_CANDIDATES=${MAS_GSPO_NUM_CANDIDATES}")
+fi
+
+if [[ -n "${MAS_MAX_NEW_TOKENS:-}" ]]; then
+  CMD+=("MAS_MAX_NEW_TOKENS=${MAS_MAX_NEW_TOKENS}")
+fi
+
+if [[ -n "${MAS_TRAIN_NUM_ROUNDS:-}" ]]; then
+  CMD+=("MAS_TRAIN_NUM_ROUNDS=${MAS_TRAIN_NUM_ROUNDS}")
+fi
+
+if [[ -n "${MAS_INFER_NUM_ROUNDS:-}" ]]; then
+  CMD+=("MAS_INFER_NUM_ROUNDS=${MAS_INFER_NUM_ROUNDS}")
+fi
+
+if [[ -n "${MAS_EXPAND_ALL_TRAIN_BRANCHES:-}" ]]; then
+  CMD+=("MAS_EXPAND_ALL_TRAIN_BRANCHES=${MAS_EXPAND_ALL_TRAIN_BRANCHES}")
+fi
+
+if [[ -n "${MAS_CHECKPOINT_DIR:-}" ]]; then
+  CMD+=("MAS_CHECKPOINT_DIR=${MAS_CHECKPOINT_DIR}")
+fi
+
+if [[ -n "${MAS_CHECKPOINT_EVERY_SAMPLES:-}" ]]; then
+  CMD+=("MAS_CHECKPOINT_EVERY_SAMPLES=${MAS_CHECKPOINT_EVERY_SAMPLES}")
+fi
+
+if [[ -n "${MAS_RESUME_CHECKPOINT:-}" ]]; then
+  CMD+=("MAS_RESUME_CHECKPOINT=${MAS_RESUME_CHECKPOINT}")
+fi
+
+CMD+=("${ENV_PYTHON}" "${PROJECT_ROOT}/run_three_layer_only_4gpu.py")
+"${CMD[@]}" 2>&1 | tee "${RUN_DIR}/train.log"
