@@ -1,0 +1,76 @@
+{
+  "name": "28_single_pending_neg1_replace_round5",
+  "family": "proposal_review",
+  "kind": "train_eval",
+  "description": "复制 27，仅改两点：不再区分 pending/incumbent，只保留单个 pending；只有当 pending 净票数 <= -1 时，refresh 的新答案才允许替代当前 pending。训练和测试轮数均为 5。",
+  "generated_at": "2026-04-28T14:48:34",
+  "global_seed": 42,
+  "num_agents": 2,
+  "train_num_rounds": 5,
+  "infer_num_rounds": 5,
+  "train_size": 100,
+  "val_size": 100,
+  "test_size": 100,
+  "env_overrides": {
+    "MAS_TRAIN_NUM_ROUNDS": "5",
+    "MAS_INFER_NUM_ROUNDS": "5",
+    "MAS_PARALLEL_MODE": "three_layer_workers",
+    "MAS_GSPO_FINETUNE_MODE": "lora",
+    "MAS_MAX_NEW_TOKENS": "256",
+    "MAS_GSPO_TRAIN_DTYPE": "auto",
+    "MAS_GSPO_NUM_GREEDY_CANDIDATES": "1",
+    "MAS_GSPO_LORA_R": "8",
+    "MAS_GSPO_LORA_ALPHA": "16",
+    "MAS_GSPO_LORA_DROPOUT": "0.0",
+    "MAS_GSPO_SAMPLE_CANDIDATE_CHUNK_SIZE": "1",
+    "MAS_GSPO_UPDATE_CANDIDATE_CHUNK_SIZE": "1",
+    "MAS_TRAIN_MAX_NEW_TOKENS": "256",
+    "MAS_EVAL_MAX_NEW_TOKENS": "256",
+    "MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS": "32",
+    "MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS": "16",
+    "MAS_PROPOSAL_REFRESH_SAME_PRED_PENALTY": "0.0"
+  },
+  "module_overrides": {
+    "THREE_LAYER_MIDDLE_ACTION_SCHEMA": "proposal_review",
+    "THREE_LAYER_REGRET_UPDATE_MODE": "selected_only",
+    "THREE_LAYER_REALIZED_BRANCH_SELECTION": "first",
+    "PROPOSAL_REVIEW_BOOTSTRAP_ACCEPT_SCORE": 2,
+    "PROPOSAL_REVIEW_BOOTSTRAP_DROP_SCORE": -1,
+    "PROPOSAL_REVIEW_REPLACE_ACCEPT_SCORE": 2,
+    "PROPOSAL_REVIEW_DROP_SCORE": -1
+  },
+  "deterministic_eval_overrides": {
+    "THREE_LAYER_EVAL_DETERMINISTIC_ACTIONS": true,
+    "GSPO_EVAL_DO_SAMPLE": false
+  },
+  "use_relaxed_prompts": false,
+  "use_proposal_review_prompts": true,
+  "run_validation": false,
+  "gspo_finetune_mode": "lora",
+  "gspo_lora_r": 8,
+  "gspo_lora_alpha": 16,
+  "gspo_lora_dropout": 0.0,
+  "train_max_new_tokens": 256,
+  "eval_max_new_tokens": 256,
+  "parallel_mode": "three_layer_workers",
+  "effective_use_outer_scheduler": false,
+  "effective_num_agents": 1,
+  "effective_runtime_architecture": "controller + proposer + reviewer",
+  "evaluation_protocols": [
+    {
+      "name": "controller_stochastic",
+      "controller_deterministic": false,
+      "inner_deterministic": true,
+      "controller_policy_source": "average_strategy_sample"
+    },
+    {
+      "name": "controller_greedy",
+      "controller_deterministic": true,
+      "inner_deterministic": true,
+      "controller_policy_source": "average_strategy_argmax"
+    }
+  ],
+  "require_cuda": true,
+  "cuda_available": true,
+  "device_count": 2
+}

@@ -1,0 +1,2 @@
+{"timestamp": 1777358174.1010947, "exp_name": "28_single_pending_neg1_replace_round5 训练", "processed": 1, "total": 100, "round_accuracy": [1.0, 1.0, 1.0, 1.0, 1.0], "best_so_far_accuracy": [1.0, 1.0, 1.0, 1.0, 1.0]}
+{"timestamp": 1777358554.8207521, "exp_name": "28_single_pending_neg1_replace_round5 训练", "processed": 5, "total": 100, "round_accuracy": [0.6, 0.6, 0.6, 0.6, 0.6], "best_so_far_accuracy": [0.6, 0.6, 0.6, 0.6, 0.6]}
