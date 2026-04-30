@@ -14,7 +14,20 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from src.config import *
-from src.data_loader import load_gsm8k_motac, load_gsm8k_splits, compute_accuracy, extract_pred_num
+from src.data_loader import (
+    ANSWER_FORMAT_GPQA_DIAMOND,
+    ANSWER_FORMAT_MATH500,
+    answer_reward,
+    answers_match,
+    compute_accuracy,
+    extract_pred_num,
+    get_active_answer_format,
+    get_answer_format_from_item,
+    load_gsm8k_motac,
+    load_gsm8k_splits,
+    same_answer_value,
+    set_active_answer_format,
+)
 from src.model_loader import generate_response, get_gpt2
 from src.gspo_verl import GSPOAgentPolicy
 from src.cfr_core import CFRBehaviorSelector
@@ -413,7 +426,25 @@ def is_exact_match(pred_num, gt):
     这里和 data_loader.compute_accuracy() 保持同一判定标准：
     - 都允许 1e-3 以内的浮点误差
     """
-    return pred_num is not None and gt is not None and abs(pred_num - gt) < 1e-3
+    return answers_match(pred_num, gt)
+
+def get_active_reviewer_prompt():
+    answer_format = get_active_answer_format()
+    if is_proposal_review_schema():
+        if answer_format == ANSWER_FORMAT_MATH500:
+            return PI0_PROMPT_PROPOSAL_REVIEW_MATH500
+        if answer_format == ANSWER_FORMAT_GPQA_DIAMOND:
+            return PI0_PROMPT_PROPOSAL_REVIEW_GPQA
+    return PI0_PROMPT
+
+def get_active_solver_prompt():
+    answer_format = get_active_answer_format()
+    if is_proposal_review_schema():
+        if answer_format == ANSWER_FORMAT_MATH500:
+            return PI1_PROMPT_PROPOSAL_REVIEW_MATH500
+        if answer_format == ANSWER_FORMAT_GPQA_DIAMOND:
+            return PI1_PROMPT_PROPOSAL_REVIEW_GPQA
+    return PI1_PROMPT
 
 def render_history_turn(turn):
     """
@@ -663,6 +694,9 @@ def _extract_review_target_pred(text):
                 return pred
         if not REVIEW_TARGET_ANSWER_CUE_PATTERN.search(candidate_text):
             continue
+        pred = extract_pred_num(candidate_text)
+        if pred is not None:
+            return pred
         pred = _extract_reason_pred_from_text(candidate_text)
         if pred is not None:
             return pred
@@ -1029,7 +1063,10 @@ def _extract_explicit_proposal_candidate(lines):
 def _normalize_numeric_text(value):
     if value is None:
         return None
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value).strip() or None
     if abs(numeric - round(numeric)) < 1e-9:
         return str(int(round(numeric)))
     return f"{numeric:g}"
@@ -1169,10 +1206,7 @@ def _extract_proposal_answer_cue_pred(text):
             answer_tail = hash_match.group("tail") if hash_match else None
         if answer_tail is None:
             continue
-        pred = _extract_last_numeric_after_equals(answer_tail)
-        if pred is not None:
-            return pred
-        pred = _extract_leading_standalone_answer_pred(answer_tail)
+        pred = extract_pred_num(line)
         if pred is not None:
             return pred
     return None
@@ -1191,6 +1225,9 @@ def _extract_strict_proposal_final_pred(text):
     if match:
         return _parse_numeric_token(match.group(1))
     if "\\boxed" in last_line.lower():
+        return extract_pred_num(last_line)
+    answer_tail_match = PROPOSAL_ANSWER_PREFIX_PATTERN.match(last_line)
+    if answer_tail_match:
         return extract_pred_num(last_line)
     return None
 
@@ -1369,6 +1406,15 @@ def get_proposal_review_proposal_mode(
 def get_proposal_review_proposer_prompt(proposal_mode):
     if PROPOSAL_REVIEW_USE_LEGACY_PROMPTS:
         return PI1_PROMPT
+    answer_format = get_active_answer_format()
+    if answer_format == ANSWER_FORMAT_MATH500:
+        if proposal_mode == "refresh_pending":
+            return PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_MATH500
+        return PI1_PROMPT_PROPOSAL_REVIEW_MATH500
+    if answer_format == ANSWER_FORMAT_GPQA_DIAMOND:
+        if proposal_mode == "refresh_pending":
+            return PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_GPQA
+        return PI1_PROMPT_PROPOSAL_REVIEW_GPQA
     if proposal_mode == "refresh_pending":
         return PI1_PROMPT_PROPOSAL_REVIEW_REFRESH
     return PI1_PROMPT_PROPOSAL_REVIEW
@@ -1437,7 +1483,7 @@ def rollout_proposal_review_terminal_value(
                     pending_vote_score=sim_pending_vote_score,
                     include_latest_review_reason=False,
                 ),
-                prompt_override=PI0_PROMPT,
+                prompt_override=get_active_reviewer_prompt(),
             )
             review_outcome = resolve_review_action_outcome(
                 sim_history,
@@ -2273,6 +2319,12 @@ def get_pending_controller_score_bucket(pending_vote_score, pending_candidate_te
     if not has_pending_candidate(pending_candidate_text):
         return "none"
     score = int(pending_vote_score or 0)
+    if PROPOSAL_REVIEW_FINE_GRAINED_VOTE_STATE:
+        if score > 0:
+            return f"vote_plus_{score}"
+        if score < 0:
+            return f"vote_minus_{abs(score)}"
+        return "vote_0"
     return "score1" if score >= 1 else "score0"
 
 def get_remaining_proposal_rounds_bucket(rnd, total_rounds=NUM_ROUNDS):
@@ -2319,14 +2371,13 @@ def reward_from_pred(pred_num, gt):
     公式：
         reward = w_exact * exact_match + w_dense * dense_score
     """
-    if pred_num is None or gt is None:
-        return REWARD_MISSING_PENALTY
-
-    exact_reward = 1.0 if is_exact_match(pred_num, gt) else 0.0
-    scale = max(abs(gt), 1.0)
-    rel_error = abs(pred_num - gt) / scale
-    dense_reward = 1.0 / (1.0 + rel_error)
-    return REWARD_EXACT_WEIGHT * exact_reward + REWARD_DENSE_WEIGHT * dense_reward
+    return answer_reward(
+        pred_num,
+        gt,
+        missing_penalty=REWARD_MISSING_PENALTY,
+        exact_weight=REWARD_EXACT_WEIGHT,
+        dense_weight=REWARD_DENSE_WEIGHT,
+    )
 
 def reward_delta_from_preds(previous_pred, current_pred, gt):
     """
@@ -2388,7 +2439,7 @@ def compute_phase(prev_phase_value, rnd, eps=PHASE_Q_EPS):
 def same_numeric_prediction(pred_a, pred_b, tol=1e-9):
     if pred_a is None or pred_b is None:
         return False
-    return abs(float(pred_a) - float(pred_b)) < tol
+    return same_answer_value(pred_a, pred_b)
 
 def compute_phase_update_signal(
     act,
@@ -3308,7 +3359,7 @@ def average_next_answer_reward(
     """
     answer_text = agent_bundle["pi1"].sample_text(
         build_context(question, history),
-        prompt_override=PI1_PROMPT,
+        prompt_override=get_active_solver_prompt(),
     )
     answer_pred = extract_pred_num(answer_text)
     return rollout_terminal_absolute_reward(answer_pred, incumbent_pred, gt)
@@ -3326,7 +3377,7 @@ def batch_next_answer_rewards(
     contexts = [build_context(question, history) for history in histories]
     answer_texts = agent_bundle["pi1"].sample_text_batch(
         contexts,
-        prompt_override=PI1_PROMPT,
+        prompt_override=get_active_solver_prompt(),
     )
     rewards = []
     for answer_text in answer_texts:
@@ -3359,7 +3410,7 @@ def average_answer_delta_reward(
     """
     answer_text = agent_bundle["pi1"].sample_text(
         build_context(question, history),
-        prompt_override=PI1_PROMPT,
+        prompt_override=get_active_solver_prompt(),
     )
     answer_pred = extract_pred_num(answer_text)
     return rollout_terminal_delta_reward(answer_pred, incumbent_pred, gt)
@@ -3446,7 +3497,7 @@ def average_policy_stack_answer_reward(agent_bundle, question, history, gt, num_
     """
     answer_text = agent_bundle["pi1"].sample_text(
         build_context(question, history),
-        prompt_override=PI1_PROMPT,
+        prompt_override=get_active_solver_prompt(),
     )
     answer_pred = extract_pred_num(answer_text)
     return reward_from_pred(answer_pred, gt)
@@ -3541,7 +3592,7 @@ def estimate_policy_stack_comment_value(
     if comment_text is None:
         comment_text = agent_bundle["pi0"].sample_text(
             build_context(question, history),
-            prompt_override=PI0_PROMPT,
+            prompt_override=get_active_reviewer_prompt(),
         )
     next_history = append_round_output(
         history,
@@ -3651,7 +3702,7 @@ def estimate_policy_stack_answer_value(
         agent_bundle["pi1"],
         question,
         history,
-        prompt_override=PI1_PROMPT,
+        prompt_override=get_active_solver_prompt(),
     )
     values = compute_centered_answer_candidate_values(batch, gt, silent_baseline)
     return sum(values) / len(values) if values else 0.0
@@ -3680,7 +3731,7 @@ def estimate_policy_stack_comment_value_mean(
         agent_bundle["pi0"],
         question,
         history,
-        prompt_override=PI0_PROMPT,
+        prompt_override=get_active_reviewer_prompt(),
     )
     step = {
         "question": question,
@@ -3821,7 +3872,7 @@ def estimate_middle_action_values(
                     rnd,
                     f"reviewer_cf_agent{selected_agent}",
                     "review",
-                    prompt_override=PI0_PROMPT,
+                    prompt_override=get_active_reviewer_prompt(),
                     total_rounds=total_rounds,
                     context_override=context_override,
                 )
@@ -4415,7 +4466,7 @@ def run_three_layer_proposal_review_action(
                 rnd,
                 f"reviewer_bundle{selected_role_bundle_idx}",
                 "review",
-                prompt_override=PI0_PROMPT,
+                prompt_override=get_active_reviewer_prompt(),
                 total_rounds=total_rounds,
                 context_override=context_override,
             )
@@ -4451,7 +4502,7 @@ def run_three_layer_proposal_review_action(
                 rnd,
                 f"reviewer_bundle{selected_role_bundle_idx}",
                 "review",
-                prompt_override=PI0_PROMPT,
+                prompt_override=get_active_reviewer_prompt(),
                 total_rounds=total_rounds,
                 context_override=context_override,
             )
@@ -4485,7 +4536,7 @@ def run_three_layer_proposal_review_action(
                 rnd,
                 f"reviewer_bundle{selected_role_bundle_idx}",
                 "review",
-                prompt_override=PI0_PROMPT,
+                prompt_override=get_active_reviewer_prompt(),
                 total_rounds=total_rounds,
                 context_override=context_override,
             )
@@ -4872,7 +4923,7 @@ def run_three_layer_realized_action(
                 rnd,
                 f"agent{selected_agent}_pi0",
                 "comment",
-                prompt_override=PI0_PROMPT,
+                prompt_override=get_active_reviewer_prompt(),
                 total_rounds=total_rounds,
             )
             comment_rewards = compute_policy_stack_comment_candidate_rewards(
@@ -4903,7 +4954,7 @@ def run_three_layer_realized_action(
                 rnd,
                 f"agent{selected_agent}_pi0",
                 "comment",
-                prompt_override=PI0_PROMPT,
+                prompt_override=get_active_reviewer_prompt(),
                 total_rounds=total_rounds,
             )
             realized_middle_value = float(
@@ -4977,7 +5028,7 @@ def run_three_layer_realized_action(
                 rnd,
                 f"agent{selected_agent}_pi1",
                 "answer",
-                prompt_override=PI1_PROMPT,
+                prompt_override=get_active_solver_prompt(),
                 total_rounds=total_rounds,
             )
             answer_rewards = compute_answer_candidate_rewards(
@@ -5011,7 +5062,7 @@ def run_three_layer_realized_action(
                 rnd,
                 f"agent{selected_agent}_pi1",
                 "answer",
-                prompt_override=PI1_PROMPT,
+                prompt_override=get_active_solver_prompt(),
                 total_rounds=total_rounds,
             )
             current_pred = extract_pred_num(step["selected_text"])
@@ -6118,6 +6169,7 @@ def run_policy_stack_experiment(
         ),
         start=start_sample_offset + 1,
     ):
+        set_active_answer_format(get_answer_format_from_item(item))
         q, gt = item["question"], item["ground_truth"]
         active_branches = [init_three_layer_sample_state()]
         representative_state = active_branches[0]

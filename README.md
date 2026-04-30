@@ -1,6 +1,6 @@
-# Final GSM8K Ablation Suite
+# Final Multi-Benchmark Ablation Suite
 
-这个目录是论文最终消融实验入口。`01_main_exp30` 复用实验 30 的 proposal-review 逻辑；`02` 起是围绕论文需要解释的关键机制做的消融。所有实验默认使用 GSM8K 官方全量 `train` split 做在线训练，官方全量 `test` split 做最终测试，不再切 validation。
+这个目录是论文最终消融实验入口。`01_main_exp30` 以实验 30 的 proposal-review 逻辑为基础，并采用实验 31 的细粒度中层投票 state；`02` 起是围绕论文需要解释的关键机制做的消融。所有实验的训练都固定使用 GSM8K 官方全量 `train` split，不切 validation；测试集可在 GSM8K、MATH-500 和 GPQA-Diamond 中选择。
 
 ## 主实验逻辑
 
@@ -14,12 +14,13 @@
 - 瞬时遗憾使用期望基线：`re(a, s) = v_a - sum_b Pi(b|s) v_b`。
 - refresh 语义沿用实验 30：只要 controller 选择 `refresh`，新 pending 可以取代旧 pending；不要求旧 pending 的净票数小于 0。
 - 默认不启用投票阈值状态机；reviewer verdict 只累积 `pending_vote_score`，不会自动 promote/drop pending。
+- 中层 controller state 使用实验 31 的细粒度票数分桶：有 pending 时按精确净票数写入 `pending_score_bucket`，例如 `vote_0`、`vote_plus_1`、`vote_plus_2`、`vote_minus_1`，再与 `proposal_time_bucket` 组合成 state。
 
 ## 实验编号
 
 | 编号 | 名称 | 消融问题 |
 | --- | --- | --- |
-| 01 | `01_main_exp30` | 主实验，完整 proposal-review + learned controller + refresh 可替换任意 pending。 |
+| 01 | `01_main_exp30` | 主实验，完整 proposal-review + learned controller + refresh 可替换任意 pending + 细粒度投票 state。 |
 | 02 | `02_fixed_keep_refresh_controller` | 去掉 learned controller，proposal stage 固定 keep/refresh 周期。 |
 | 03 | `03_always_refresh_controller` | controller 固定 refresh，检验是否只是持续重采样带来收益。 |
 | 04 | `04_always_keep_controller` | controller 固定 keep，检验 refresh 的必要性。 |
@@ -36,6 +37,27 @@
 | 15 | `15_unstructured_legacy_prompts` | 保留状态机，但 proposer 使用旧式非结构化 answer prompt。 |
 
 这些消融都在训练和测试两阶段同时生效，不是只在测试时改策略。
+
+细粒度投票 state 默认启用于 `01-15` 全部实验。这样主实验和所有消融在 state 表达能力上保持一致，实验差异只来自各自的消融开关。对于固定 controller、冻结 controller 或禁用 refresh 的实验，细粒度 state 不会改变固定动作本身，主要用于保持记录、checkpoint 和测试策略读取时的状态定义一致。
+
+## 底模和测试集
+
+所有实验都支持选择底模。默认是 Phi-3-mini-4k-instruct：
+
+| 参数值 | ModelScope 模型 | 说明 |
+| --- | --- | --- |
+| `phi3-mini-4k-instruct` | [LLM-Research/Phi-3-mini-4k-instruct](https://modelscope.cn/models/LLM-Research/Phi-3-mini-4k-instruct) | 默认底模。 |
+| `qwen2.5-7b-instruct` | [Qwen/Qwen2.5-7B-Instruct](https://modelscope.cn/models/Qwen/Qwen2.5-7B-Instruct) | Qwen2.5 7B Instruct。 |
+
+训练数据固定为 [GSM8K train](https://modelscope.cn/datasets/modelscope/gsm8k)。测试集通过 `--test-dataset` 或 `--test-datasets` 选择：
+
+| 参数值 | ModelScope 数据集 | 处理方式 |
+| --- | --- | --- |
+| `gsm8k` | [modelscope/gsm8k](https://modelscope.cn/datasets/modelscope/gsm8k) | 官方 test split，数值答案。 |
+| `math500` | [AI-ModelScope/MATH-500](https://modelscope.cn/datasets/AI-ModelScope/MATH-500) | 使用专用 MATH prompt，要求 `Final answer: \boxed{...}`；答案抽取保留符号/分数/坐标等原格式，并用 `math_verify` 做等价判断。 |
+| `gpqa-diamond` | [AI-ModelScope/GPQA](https://modelscope.cn/datasets/AI-ModelScope/GPQA) | 使用 `gpqa_diamond` subset，选项打乱为 `A-D`；使用专用 GPQA prompt，要求 `Final answer: <A/B/C/D>`，答案抽取只认最终选项。 |
+
+prompt 会随测试集自动切换，但 proposal-review 协议不变：reviewer 仍然第一行输出 `RIGHT/WRONG`、第二行输出短理由；proposer 仍然 single-CoT 风格简洁求解，只改变最终答案格式要求。训练阶段样本始终是 GSM8K，因此训练时使用 GSM8K 数值抽取和 GSM8K prompt；测试阶段按当前测试集切换到对应抽取器和 prompt。
 
 ## 指标
 
@@ -78,6 +100,24 @@ conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py
 conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py --experiments 01_main_exp30
 ```
 
+指定底模和测试集：
+
+```bash
+conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py \
+  --experiments 01_main_exp30 \
+  --base-model qwen2.5-7b-instruct \
+  --test-dataset gpqa-diamond
+```
+
+跑两个底模和三个测试集的网格：
+
+```bash
+conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py \
+  --experiments 01_main_exp30 02_fixed_keep_refresh_controller \
+  --base-models phi3-mini-4k-instruct qwen2.5-7b-instruct \
+  --test-datasets gsm8k math500 gpqa-diamond
+```
+
 也可以直接运行编号脚本：
 
 ```bash
@@ -88,7 +128,11 @@ conda run --no-capture-output -n lcs-metax python -u 11_reviewer_frozen.py
 小样本 smoke test：
 
 ```bash
-conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py --experiments 01_main_exp30 --train-limit 2 --test-limit 2 --checkpoint-every 1
+conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py \
+  --experiments 01_main_exp30 \
+  --train-limit 2 \
+  --test-limit 2 \
+  --checkpoint-every 1
 ```
 
 ## 并行和多卡
@@ -178,6 +222,23 @@ conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py \
 
 这种方式允许每个实验自由决定可用卡；如果多个实验显式写成同一组 GPU，代码不会阻止，但会共享显存，通常不建议。
 
+当同时跑多个底模/测试集组合时，输出目录会带上组合后缀，例如：
+
+```text
+01_main_exp30__model-qwen2.5-7b-instruct__test-gpqa-diamond
+```
+
+`--experiment-device-map` 可以写实验名，也可以写完整 `run_name`。写实验名会影响该实验的所有底模/测试集组合；写完整 `run_name` 只影响那一个组合：
+
+```bash
+conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py \
+  --experiments 01_main_exp30 \
+  --base-models phi3-mini-4k-instruct qwen2.5-7b-instruct \
+  --test-datasets gsm8k gpqa-diamond \
+  --experiment-workers 2 \
+  --experiment-device-map '01_main_exp30__model-qwen2.5-7b-instruct__test-gpqa-diamond=2,3'
+```
+
 如果每个实验只给一张卡，可用：
 
 ```bash
@@ -191,6 +252,10 @@ conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py \
 
 ### 参数速查
 
+- `--base-model phi3-mini-4k-instruct|qwen2.5-7b-instruct`：单个底模。
+- `--base-models phi3-mini-4k-instruct qwen2.5-7b-instruct`：按底模展开网格，覆盖 `--base-model`。
+- `--test-dataset gsm8k|math500|gpqa-diamond`：单个测试集；训练仍固定是 GSM8K train。
+- `--test-datasets gsm8k math500 gpqa-diamond`：按测试集展开网格，覆盖 `--test-dataset`。
 - `--parallel-mode three_layer_workers|serial`：单实验内部是否启用 policy workers。
 - `--policy-device-map agent0.pi0:0,agent0.pi1:1`：显式指定 reviewer/proposer 的 GPU。
 - `--cuda-visible-devices 0,1`：所有实验子进程共同使用的可见 GPU。
@@ -206,7 +271,7 @@ conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py \
 
 每个实验一个子目录，包含：
 
-- `metadata.json`：实验设置、数据 split、模块开关。
+- `metadata.json`：实验设置、底模、数据 split、ModelScope 链接、模块开关。
 - `summary.json`：训练 R1-R5 和两种测试模式的汇总。
 - `summary_controller_stochastic.json` / `summary_controller_greedy.json`：单模式测试汇总。
 - `samples_controller_stochastic.jsonl` / `samples_controller_greedy.jsonl`：逐样本预测与 usage。
@@ -228,4 +293,4 @@ plots/main_train_r1_r5_accuracy.png
 - `run_final_experiments.py`：最终实验总入口、编号、指标统计、训练曲线绘图。
 - `run_all.py`：实验 30 逻辑和消融开关的实际执行位置。
 - `src/config.py`：消融开关默认值；默认值保持实验 30。
-- `src/data_loader.py`：`load_gsm8k_official_splits()` 加载官方全量 train/test。
+- `src/data_loader.py`：`load_final_train_test_splits()` 固定加载 GSM8K train，并按参数加载 GSM8K/MATH500/GPQA-Diamond 测试集。

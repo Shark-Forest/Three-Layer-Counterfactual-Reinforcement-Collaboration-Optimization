@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+data/
+models/
+logs/
+checkpoints/
+plots/
+runs/
+
+.DS_Store

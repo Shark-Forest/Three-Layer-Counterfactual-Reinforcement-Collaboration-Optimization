@@ -241,6 +241,10 @@ PROPOSAL_REVIEW_USE_LEGACY_PROMPTS = _env_flag(
     "MAS_PROPOSAL_REVIEW_USE_LEGACY_PROMPTS",
     "0",
 )
+PROPOSAL_REVIEW_FINE_GRAINED_VOTE_STATE = _env_flag(
+    "MAS_PROPOSAL_REVIEW_FINE_GRAINED_VOTE_STATE",
+    "0",
+)
 THREE_LAYER_DISABLE_PI1_UPDATES = _env_flag(
     "MAS_THREE_LAYER_DISABLE_PI1_UPDATES",
     "0",
@@ -506,6 +510,64 @@ PI1_PROMPT_PROPOSAL_REVIEW_REFRESH = (
     "If the latest review says RIGHT, keep the answer unless you find a clear error.\n"
     "Keep the reasoning concise.\n"
     "End with exactly one final line: Final answer: <number>.\n\n"
+    "Solution:\n"
+)
+PI0_PROMPT_PROPOSAL_REVIEW_MATH500 = (
+    "{context}\n\n"
+    "You are a careful reasoning assistant.\n"
+    "Check whether the current pending final answer is mathematically equivalent to the correct answer for the original problem.\n"
+    "First line: RIGHT or WRONG.\n"
+    "Second line: one short reason.\n"
+    "Do not write a new solution or a new final answer.\n\n"
+    "Review:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_MATH500 = (
+    "{context}\n\n"
+    "Solve the original math problem directly.\n"
+    "If there is a pending solution or short review feedback, use it only as a hint.\n"
+    "Keep one concise chain of thought; do not branch into alternatives.\n"
+    "Use the exact answer form required by the problem.\n"
+    "End with exactly one final line: Final answer: \\boxed{<answer>}.\n\n"
+    "Solution:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_MATH500 = (
+    "{context}\n\n"
+    "Solve the original math problem directly.\n"
+    "Use the current pending solution and the latest review only as hints.\n"
+    "If the latest review says WRONG, fix the decisive mistake and recompute.\n"
+    "If the latest review says RIGHT, keep the answer unless you find a clear error.\n"
+    "Keep one concise chain of thought; do not branch into alternatives.\n"
+    "Use the exact answer form required by the problem.\n"
+    "End with exactly one final line: Final answer: \\boxed{<answer>}.\n\n"
+    "Solution:\n"
+)
+PI0_PROMPT_PROPOSAL_REVIEW_GPQA = (
+    "{context}\n\n"
+    "You are a careful reasoning assistant.\n"
+    "Check whether the current pending option letter is correct for the original multiple-choice science question.\n"
+    "First line: RIGHT or WRONG.\n"
+    "Second line: one short reason.\n"
+    "Do not write a new solution or a new final answer.\n\n"
+    "Review:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_GPQA = (
+    "{context}\n\n"
+    "Solve the original multiple-choice science question directly.\n"
+    "If there is a pending solution or short review feedback, use it only as a hint.\n"
+    "Keep one concise chain of thought; do not branch into alternatives.\n"
+    "Choose exactly one option letter from A, B, C, and D.\n"
+    "End with exactly one final line: Final answer: <A/B/C/D>.\n\n"
+    "Solution:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_GPQA = (
+    "{context}\n\n"
+    "Solve the original multiple-choice science question directly.\n"
+    "Use the current pending solution and the latest review only as hints.\n"
+    "If the latest review says WRONG, fix the decisive mistake and choose again.\n"
+    "If the latest review says RIGHT, keep the option unless you find a clear error.\n"
+    "Keep one concise chain of thought; do not branch into alternatives.\n"
+    "Choose exactly one option letter from A, B, C, and D.\n"
+    "End with exactly one final line: Final answer: <A/B/C/D>.\n\n"
     "Solution:\n"
 )
 

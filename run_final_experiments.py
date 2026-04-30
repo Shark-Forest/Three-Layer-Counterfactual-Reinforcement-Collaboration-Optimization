@@ -19,6 +19,37 @@ CHECKPOINT_EVERY_SAMPLES = int(
     os.environ.get("FINAL_CHECKPOINT_EVERY_SAMPLES", "50") or "50"
 )
 
+DEFAULT_BASE_MODEL = "phi3-mini-4k-instruct"
+DEFAULT_TEST_DATASET = "gsm8k"
+
+BASE_MODEL_REGISTRY = {
+    "phi3-mini-4k-instruct": {
+        "label": "Phi-3-mini-4k-instruct",
+        "model_scope": "LLM-Research/Phi-3-mini-4k-instruct",
+        "modelscope_url": "https://modelscope.cn/models/LLM-Research/Phi-3-mini-4k-instruct",
+    },
+    "qwen2.5-7b-instruct": {
+        "label": "Qwen2.5-7B-Instruct",
+        "model_scope": "Qwen/Qwen2.5-7B-Instruct",
+        "modelscope_url": "https://modelscope.cn/models/Qwen/Qwen2.5-7B-Instruct",
+    },
+}
+
+TEST_DATASET_REGISTRY = {
+    "gsm8k": {
+        "label": "GSM8K",
+        "modelscope_url": "https://modelscope.cn/datasets/modelscope/gsm8k",
+    },
+    "math500": {
+        "label": "MATH-500",
+        "modelscope_url": "https://modelscope.cn/datasets/AI-ModelScope/MATH-500",
+    },
+    "gpqa-diamond": {
+        "label": "GPQA-Diamond",
+        "modelscope_url": "https://modelscope.cn/datasets/AI-ModelScope/GPQA",
+    },
+}
+
 BASE_ENV = {
     "MAS_TRAIN_NUM_ROUNDS": "5",
     "MAS_INFER_NUM_ROUNDS": "5",
@@ -50,9 +81,13 @@ BASE_MODULE_OVERRIDES = {
     "PROPOSAL_REVIEW_DROP_SCORE": -1,
 }
 
+FINE_VOTE_STATE_OVERRIDES = {
+    "PROPOSAL_REVIEW_FINE_GRAINED_VOTE_STATE": True,
+}
+
 
 def build_experiment_specs():
-    return [
+    specs = [
         {
             "name": "01_main_exp30",
             "paper_label": "Main",
@@ -191,6 +226,10 @@ def build_experiment_specs():
             "use_legacy_prompt_override": True,
         },
     ]
+    for spec in specs:
+        module_overrides = spec.setdefault("module_overrides", {})
+        module_overrides.update(FINE_VOTE_STATE_OVERRIDES)
+    return specs
 
 
 def spec_by_name(name):
@@ -198,6 +237,64 @@ def spec_by_name(name):
         if spec["name"] == name:
             return spec
     raise KeyError(f"unknown experiment: {name}")
+
+
+def normalize_base_model_key(name):
+    key = str(name or DEFAULT_BASE_MODEL).strip().lower().replace("_", "-")
+    aliases = {
+        "phi3": "phi3-mini-4k-instruct",
+        "phi-3": "phi3-mini-4k-instruct",
+        "phi3-mini": "phi3-mini-4k-instruct",
+        "phi-3-mini": "phi3-mini-4k-instruct",
+        "phi3-mini-4k-instruct": "phi3-mini-4k-instruct",
+        "phi-3-mini-4k-instruct": "phi3-mini-4k-instruct",
+        "qwen": "qwen2.5-7b-instruct",
+        "qwen2.5": "qwen2.5-7b-instruct",
+        "qwen2.5-7b": "qwen2.5-7b-instruct",
+        "qwen2.5-7b-instruct": "qwen2.5-7b-instruct",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"unknown base model: {name}. choices: "
+            + ", ".join(BASE_MODEL_REGISTRY)
+        )
+    return aliases[key]
+
+
+def normalize_test_dataset_key(name):
+    key = str(name or DEFAULT_TEST_DATASET).strip().lower().replace("_", "-")
+    aliases = {
+        "gsm8k": "gsm8k",
+        "math": "math500",
+        "math500": "math500",
+        "math-500": "math500",
+        "gpqa": "gpqa-diamond",
+        "gpqa-diamond": "gpqa-diamond",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"unknown test dataset: {name}. choices: "
+            + ", ".join(TEST_DATASET_REGISTRY)
+        )
+    return aliases[key]
+
+
+def resolve_base_model_keys(args):
+    raw_values = args.base_models if args.base_models else [args.base_model]
+    return [normalize_base_model_key(value) for value in raw_values]
+
+
+def resolve_test_dataset_keys(args):
+    raw_values = args.test_datasets if args.test_datasets else [args.test_dataset]
+    return [normalize_test_dataset_key(value) for value in raw_values]
+
+
+def build_experiment_run_name(exp_name, base_model, test_dataset):
+    base_model = normalize_base_model_key(base_model)
+    test_dataset = normalize_test_dataset_key(test_dataset)
+    if base_model == DEFAULT_BASE_MODEL and test_dataset == DEFAULT_TEST_DATASET:
+        return exp_name
+    return f"{exp_name}__model-{base_model}__test-{test_dataset}"
 
 
 def configure_child_environment(exp_dir):
@@ -252,6 +349,7 @@ def collect_parallel_worker_overrides(modules):
         "PROPOSAL_REVIEW_DISABLE_REFRESH",
         "PROPOSAL_REVIEW_DISABLE_REVIEW_FEEDBACK_CONTEXT",
         "PROPOSAL_REVIEW_USE_LEGACY_PROMPTS",
+        "PROPOSAL_REVIEW_FINE_GRAINED_VOTE_STATE",
         "THREE_LAYER_DISABLE_PI0_UPDATES",
         "THREE_LAYER_DISABLE_PI1_UPDATES",
         "THREE_LAYER_DISABLE_ALL_GSPO_UPDATES",
@@ -465,7 +563,8 @@ def safe_float(value):
     try:
         return float(value)
     except (TypeError, ValueError):
-        return None
+        text = str(value).strip()
+        return text or None
 
 
 def is_correct(run_all, pred, gt):
@@ -498,6 +597,10 @@ def build_sample_record(run_all, sample_index, item, buffers, usage):
     record = {
         "sample_index": int(sample_index),
         "question": item.get("question"),
+        "answer_format": item.get("answer_format"),
+        "source_dataset": item.get("source_dataset"),
+        "ground_truth_raw": item.get("ground_truth_raw"),
+        "ground_truth_choice": item.get("ground_truth_choice"),
         "ground_truth": safe_float(gt),
         "round_preds": [safe_float(value) for value in round_preds],
         "round_correct": [is_correct(run_all, pred, gt) for pred in round_preds],
@@ -765,12 +868,26 @@ def parse_experiment_device_map(raw_value):
     return mapping
 
 
-def build_child_env(run_root, spec, args, device_group=None, slot_idx=None):
+def build_child_env(
+    run_root,
+    spec,
+    args,
+    base_model,
+    test_dataset,
+    device_group=None,
+    slot_idx=None,
+):
+    base_model = normalize_base_model_key(base_model)
+    test_dataset = normalize_test_dataset_key(test_dataset)
+    model_info = BASE_MODEL_REGISTRY[base_model]
     env = os.environ.copy()
     env.update(BASE_ENV)
     env.update({str(k): str(v) for k, v in spec.get("env_overrides", {}).items()})
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     env["FINAL_RUN_ROOT"] = str(run_root)
+    env["FINAL_BASE_MODEL"] = base_model
+    env["FINAL_TEST_DATASET"] = test_dataset
+    env["MAS_MODEL_SCOPE"] = model_info["model_scope"]
     env["MAS_GLOBAL_SEED"] = env.get("MAS_GLOBAL_SEED", "42")
     env["MAS_THREE_LAYER_DEBUG_PRINT"] = "0"
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -792,7 +909,14 @@ def build_child_env(run_root, spec, args, device_group=None, slot_idx=None):
 
 def run_child(spec_name, root_dir, args):
     spec = spec_by_name(spec_name)
-    exp_dir = root_dir / spec["name"]
+    base_model = normalize_base_model_key(args.base_model)
+    test_dataset = normalize_test_dataset_key(args.test_dataset)
+    model_info = BASE_MODEL_REGISTRY[base_model]
+    test_dataset_info = TEST_DATASET_REGISTRY[test_dataset]
+    os.environ["FINAL_BASE_MODEL"] = base_model
+    os.environ["FINAL_TEST_DATASET"] = test_dataset
+    os.environ["MAS_MODEL_SCOPE"] = model_info["model_scope"]
+    exp_dir = root_dir / build_experiment_run_name(spec["name"], base_model, test_dataset)
     configure_child_environment(exp_dir)
     os.environ["MAS_CHECKPOINT_EVERY_SAMPLES"] = str(args.checkpoint_every)
     for name, value in spec.get("env_overrides", {}).items():
@@ -831,9 +955,10 @@ def run_child(spec_name, root_dir, args):
     apply_overrides([config, gspo_verl, run_all], prompt_overrides)
 
     set_global_seed(config.GLOBAL_SEED, torch, np)
-    splits = data_loader.load_gsm8k_official_splits(
+    splits = data_loader.load_final_train_test_splits(
         train_limit=args.train_limit,
         test_limit=args.test_limit,
+        test_dataset=test_dataset,
     )
     train_data = splits["train"]
     test_data = splits["test"]
@@ -845,10 +970,20 @@ def run_child(spec_name, root_dir, args):
         "family": spec["family"],
         "description": spec["description"],
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "run_name": exp_dir.name,
+        "base_model": base_model,
+        "base_model_label": model_info["label"],
+        "model_scope": model_info["model_scope"],
+        "modelscope_model_url": model_info["modelscope_url"],
+        "test_dataset": test_dataset,
+        "test_dataset_label": test_dataset_info["label"],
+        "modelscope_test_dataset_url": test_dataset_info["modelscope_url"],
         "train_split": "official_gsm8k_train",
-        "test_split": "official_gsm8k_test",
+        "test_split": f"{test_dataset}_test",
         "train_size": len(train_data),
         "test_size": len(test_data),
+        "test_raw_size": splits.get("test_raw_size"),
+        "test_processed_size": splits.get("test_processed_size"),
         "train_limit": args.train_limit,
         "test_limit": args.test_limit,
         "num_rounds": {
@@ -856,9 +991,11 @@ def run_child(spec_name, root_dir, args):
             "test": int(config.INFER_NUM_ROUNDS),
         },
         "data_protocol": (
-            "Use the official GSM8K train split for online training and the "
-            "official GSM8K test split for evaluation. No validation split is "
-            "carved out in the final suite."
+            "Use the official GSM8K train split for online training. Evaluate "
+            f"on the selected test set: {test_dataset}. No validation split is "
+            "carved out in the final suite. Prompt templates, final-answer "
+            "extractors, exact-match checks, and rewards switch by each "
+            "sample's answer_format."
         ),
         "evaluation_protocols": [
             {
@@ -874,7 +1011,11 @@ def run_child(spec_name, root_dir, args):
                 "controller_policy_source": "average_strategy_argmax",
             },
         ],
-        "env_overrides": {**BASE_ENV, **spec.get("env_overrides", {})},
+        "env_overrides": {
+            **BASE_ENV,
+            **spec.get("env_overrides", {}),
+            "MAS_MODEL_SCOPE": model_info["model_scope"],
+        },
         "module_overrides": module_overrides,
         "parallel": {
             "parallel_mode": os.environ.get("MAS_PARALLEL_MODE"),
@@ -898,7 +1039,7 @@ def run_child(spec_name, root_dir, args):
         train_data,
         update_params=True,
         log_metrics=False,
-        exp_name=f"{spec['name']} 训练",
+        exp_name=f"{exp_dir.name} 训练",
         teardown=False,
         checkpoint_options=checkpoint_options,
         force_use_average_strategy=False,
@@ -919,7 +1060,7 @@ def run_child(spec_name, root_dir, args):
                 mode=mode,
                 runtime=runtime,
                 test_data=test_data,
-                exp_name=spec["name"],
+                exp_name=exp_dir.name,
                 exp_dir=exp_dir,
                 config=config,
                 gspo_verl=gspo_verl,
@@ -941,7 +1082,7 @@ def run_child(spec_name, root_dir, args):
 
     summary = {
         **metadata,
-        "kind": "train_eval_full_gsm8k",
+        "kind": f"train_gsm8k_eval_{test_dataset}",
         "train_round_accuracy": [float(value) for value in train_round_accuracy],
         "train_curve_plot": train_plot,
         "evaluations": evals,
@@ -953,13 +1094,18 @@ def run_child(spec_name, root_dir, args):
     return summary
 
 
-def summarize_overall(root_dir, selected_names, checkpoint_every):
+def summarize_overall(root_dir, completed_jobs, checkpoint_every):
     experiments = []
-    for name in selected_names:
+    for job in completed_jobs:
+        name = job["experiment"]
         spec = spec_by_name(name)
-        path = root_dir / name / "summary.json"
+        run_name = job["run_name"]
+        path = root_dir / run_name / "summary.json"
         experiments.append({
             "name": name,
+            "run_name": run_name,
+            "base_model": job["base_model"],
+            "test_dataset": job["test_dataset"],
             "paper_label": spec.get("paper_label"),
             "family": spec["family"],
             "summary_path": str(path),
@@ -976,12 +1122,40 @@ def summarize_overall(root_dir, selected_names, checkpoint_every):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run final GSM8K main and ablation experiments.")
+    parser = argparse.ArgumentParser(description="Run final MAS main and ablation experiments.")
     parser.add_argument("--child", default=None, help="Internal: run one experiment.")
     parser.add_argument("--root-dir", default=None, help="Run root. Defaults to timestamped final/runs directory.")
     parser.add_argument("--experiments", nargs="*", default=None, help="Subset of experiment names.")
     parser.add_argument("--train-limit", type=int, default=None, help="Smoke-test cap for official train split.")
-    parser.add_argument("--test-limit", type=int, default=None, help="Smoke-test cap for official test split.")
+    parser.add_argument("--test-limit", type=int, default=None, help="Smoke-test cap for selected test split.")
+    parser.add_argument(
+        "--base-model",
+        default=DEFAULT_BASE_MODEL,
+        help="Base model used by every selected experiment in this run.",
+    )
+    parser.add_argument(
+        "--base-models",
+        nargs="*",
+        default=None,
+        help=(
+            "Run a grid over multiple base models. Overrides --base-model. "
+            "Choices: phi3-mini-4k-instruct, qwen2.5-7b-instruct."
+        ),
+    )
+    parser.add_argument(
+        "--test-dataset",
+        default=DEFAULT_TEST_DATASET,
+        help="Evaluation dataset. Training always uses the full GSM8K train split.",
+    )
+    parser.add_argument(
+        "--test-datasets",
+        nargs="*",
+        default=None,
+        help=(
+            "Run a grid over multiple evaluation datasets. Overrides "
+            "--test-dataset. Choices: gsm8k, math500, gpqa-diamond."
+        ),
+    )
     parser.add_argument("--checkpoint-every", type=int, default=CHECKPOINT_EVERY_SAMPLES)
     parser.add_argument(
         "--parallel-mode",
@@ -1035,6 +1209,19 @@ def parse_args():
 def main():
     args = parse_args()
     selected_names = args.experiments or [spec["name"] for spec in build_experiment_specs()]
+    selected_base_models = resolve_base_model_keys(args)
+    selected_test_datasets = resolve_test_dataset_keys(args)
+    jobs = [
+        {
+            "experiment": name,
+            "base_model": base_model,
+            "test_dataset": test_dataset,
+            "run_name": build_experiment_run_name(name, base_model, test_dataset),
+        }
+        for base_model in selected_base_models
+        for test_dataset in selected_test_datasets
+        for name in selected_names
+    ]
     root_dir = Path(args.root_dir).resolve() if args.root_dir else (
         RUNS_DIR / f"final_{datetime.now().strftime('%Y%m%dT%H%M%SZ')}"
     )
@@ -1047,10 +1234,11 @@ def main():
     experiment_workers = max(1, int(args.experiment_workers or 1))
     device_groups = parse_device_groups(args.device_groups)
     experiment_device_map = parse_experiment_device_map(args.experiment_device_map)
-    unknown_mapped = sorted(set(experiment_device_map) - set(selected_names))
+    valid_device_map_keys = set(selected_names) | {job["run_name"] for job in jobs}
+    unknown_mapped = sorted(set(experiment_device_map) - valid_device_map_keys)
     if unknown_mapped:
         raise ValueError(
-            "--experiment-device-map 包含未运行的实验名: "
+            "--experiment-device-map 包含未运行的实验名或 run_name: "
             + ", ".join(unknown_mapped)
         )
     if (
@@ -1063,16 +1251,20 @@ def main():
             f"当前 workers={experiment_workers}, groups={len(device_groups)}"
         )
 
-    def build_child_cmd(name):
+    def build_child_cmd(job):
         cmd = [
             sys.executable,
             str(Path(__file__).resolve()),
             "--child",
-            name,
+            job["experiment"],
             "--root-dir",
             str(root_dir),
             "--checkpoint-every",
             str(args.checkpoint_every),
+            "--base-model",
+            job["base_model"],
+            "--test-dataset",
+            job["test_dataset"],
         ]
         if args.train_limit is not None:
             cmd.extend(["--train-limit", str(args.train_limit)])
@@ -1090,16 +1282,19 @@ def main():
 
     progress = []
     return_code = 0
-    pending = list(selected_names)
+    pending = list(jobs)
     running = []
     next_slot = 0
 
     while pending or running:
         while pending and len(running) < experiment_workers and return_code == 0:
-            name = pending.pop(0)
+            job = pending.pop(0)
+            name = job["experiment"]
             group_idx = None
             device_group = None
-            if name in experiment_device_map:
+            if job["run_name"] in experiment_device_map:
+                device_group = experiment_device_map[job["run_name"]]
+            elif name in experiment_device_map:
                 device_group = experiment_device_map[name]
             elif device_groups:
                 used_group_indices = {
@@ -1119,16 +1314,21 @@ def main():
                 root_dir,
                 spec_by_name(name),
                 args,
+                job["base_model"],
+                job["test_dataset"],
                 device_group=device_group,
                 slot_idx=next_slot,
             )
             proc = subprocess.Popen(
-                build_child_cmd(name),
+                build_child_cmd(job),
                 cwd=str(PROJECT_ROOT),
                 env=child_env,
             )
             running.append({
                 "name": name,
+                "run_name": job["run_name"],
+                "base_model": job["base_model"],
+                "test_dataset": job["test_dataset"],
                 "process": proc,
                 "device_group": device_group,
                 "group_index": group_idx,
@@ -1149,6 +1349,10 @@ def main():
                 continue
             progress.append({
                 "name": item["name"],
+                "experiment": item["name"],
+                "run_name": item["run_name"],
+                "base_model": item["base_model"],
+                "test_dataset": item["test_dataset"],
                 "returncode": int(rc),
                 "device_group": item.get("device_group"),
                 "group_index": item.get("group_index"),
@@ -1168,7 +1372,15 @@ def main():
 
     overall = summarize_overall(
         root_dir,
-        [item["name"] for item in progress],
+        [
+            {
+                "experiment": item["experiment"],
+                "run_name": item["run_name"],
+                "base_model": item["base_model"],
+                "test_dataset": item["test_dataset"],
+            }
+            for item in progress
+        ],
         args.checkpoint_every,
     )
     print(json.dumps(overall, ensure_ascii=False, indent=2), flush=True)
