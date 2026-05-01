@@ -45,7 +45,7 @@ CHAT_SYSTEM_PROMPT = os.environ.get(
         "Follow the required final-line format exactly."
     ),
 ).strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAS_MAX_NEW_TOKENS", "512") or "512")
+MAX_NEW_TOKENS = int(os.environ.get("MAS_MAX_NEW_TOKENS", "256") or "256")
 TRAIN_MAX_NEW_TOKENS = int(
     os.environ.get("MAS_TRAIN_MAX_NEW_TOKENS", str(MAX_NEW_TOKENS)) or str(MAX_NEW_TOKENS)
 )
@@ -53,10 +53,10 @@ EVAL_MAX_NEW_TOKENS = int(
     os.environ.get("MAS_EVAL_MAX_NEW_TOKENS", str(MAX_NEW_TOKENS)) or str(MAX_NEW_TOKENS)
 )
 PROPOSAL_COMPLETION_MAX_NEW_TOKENS = int(
-    os.environ.get("MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS", "512") or "512"
+    os.environ.get("MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS", "256") or "256"
 )
 REVIEW_COMPLETION_MAX_NEW_TOKENS = int(
-    os.environ.get("MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS", "512") or "512"
+    os.environ.get("MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS", "256") or "256"
 )
 PROPOSAL_REVIEW_OUTPUT_MODE = os.environ.get(
     "MAS_PROPOSAL_REVIEW_OUTPUT_MODE",

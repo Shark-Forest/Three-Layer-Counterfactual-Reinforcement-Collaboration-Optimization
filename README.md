@@ -64,7 +64,7 @@ prompt 会同时随测试集和底模自动切换，但 proposal-review 协议�
 - `phi3-mini-4k-instruct` 使用默认精简 prompt，强调短推理、格式稳定和避免无根据改答案。
 - `qwen2.5-7b-instruct` 使用 Qwen 专用 prompt，仍保持同一 proposal-review 协议和 final-line 格式，但允许更充分的 decisive check、算术/符号核验、选项排除和错误定位，以发挥 7B instruct 模型更强的推理能力。
 
-所有 final 实验的生成长度默认统一为 `512`：`MAS_MAX_NEW_TOKENS=512`、`MAS_TRAIN_MAX_NEW_TOKENS=512`、`MAS_EVAL_MAX_NEW_TOKENS=512`、`MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS=512`、`MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS=512`。
+所有 final 实验的生成长度默认统一为 `256`：`MAS_MAX_NEW_TOKENS=256`、`MAS_TRAIN_MAX_NEW_TOKENS=256`、`MAS_EVAL_MAX_NEW_TOKENS=256`、`MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS=256`、`MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS=256`。
 
 ## 指标
 
@@ -269,7 +269,7 @@ conda run --no-capture-output -n lcs-metax python -u run_final_experiments.py \
 - `--experiment-workers N`：同时启动 N 个实验。
 - `--device-groups '0,1;2,3'`：多实验并行时，每个实验分配一个 GPU 组。
 - `--experiment-device-map '01_main_exp30=0,1;02_fixed_keep_refresh_controller=2'`：按实验名指定 GPU 组，覆盖 `--device-groups` 对这些实验的自动分配。
-- token 上限默认全部是 `512`；如需临时覆盖，可在启动前设置 `MAS_MAX_NEW_TOKENS`、`MAS_TRAIN_MAX_NEW_TOKENS`、`MAS_EVAL_MAX_NEW_TOKENS`、`MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS`、`MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS`。
+- token 上限默认全部是 `256`；如需临时覆盖，可在启动前设置 `MAS_MAX_NEW_TOKENS`、`MAS_TRAIN_MAX_NEW_TOKENS`、`MAS_EVAL_MAX_NEW_TOKENS`、`MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS`、`MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS`。
 
 输出目录默认是：
 
