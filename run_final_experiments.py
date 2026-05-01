@@ -63,11 +63,11 @@ BASE_ENV = {
     "MAS_GSPO_LORA_DROPOUT": "0.0",
     "MAS_GSPO_SAMPLE_CANDIDATE_CHUNK_SIZE": "1",
     "MAS_GSPO_UPDATE_CANDIDATE_CHUNK_SIZE": "1",
-    "MAS_MAX_NEW_TOKENS": "256",
-    "MAS_TRAIN_MAX_NEW_TOKENS": "256",
-    "MAS_EVAL_MAX_NEW_TOKENS": "256",
-    "MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS": "32",
-    "MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS": "16",
+    "MAS_MAX_NEW_TOKENS": "512",
+    "MAS_TRAIN_MAX_NEW_TOKENS": "512",
+    "MAS_EVAL_MAX_NEW_TOKENS": "512",
+    "MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS": "512",
+    "MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS": "512",
     "MAS_PROPOSAL_REFRESH_SAME_PRED_PENALTY": "0.0",
 }
 
@@ -340,6 +340,17 @@ def collect_parallel_worker_overrides(modules):
         "GSPO_NUM_GREEDY_CANDIDATES",
         "PI0_PROMPT",
         "PI1_PROMPT",
+        "PI0_PROMPT_PROPOSAL_REVIEW_QWEN",
+        "PI1_PROMPT_PROPOSAL_REVIEW_QWEN",
+        "PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_QWEN",
+        "PI0_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN",
+        "PI1_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN",
+        "PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_MATH500_QWEN",
+        "PI0_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN",
+        "PI1_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN",
+        "PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_GPQA_QWEN",
+        "ACTIVE_BASE_MODEL_KEY",
+        "ACTIVE_PROMPT_PROFILE",
         "PROPOSAL_REVIEW_CONTROLLER_OVERRIDE_MODE",
         "PROPOSAL_REVIEW_DISABLE_CONTROLLER_REGRET",
         "PROPOSAL_REVIEW_DISABLE_COUNTERFACTUAL_VALUES",
@@ -990,6 +1001,16 @@ def run_child(spec_name, root_dir, args):
             "train": int(config.TRAIN_NUM_ROUNDS),
             "test": int(config.INFER_NUM_ROUNDS),
         },
+        "generation_tokens": {
+            "max_new_tokens": int(config.MAX_NEW_TOKENS),
+            "train_max_new_tokens": int(config.TRAIN_MAX_NEW_TOKENS),
+            "eval_max_new_tokens": int(config.EVAL_MAX_NEW_TOKENS),
+            "proposal_completion_max_new_tokens": int(config.PROPOSAL_COMPLETION_MAX_NEW_TOKENS),
+            "review_completion_max_new_tokens": int(config.REVIEW_COMPLETION_MAX_NEW_TOKENS),
+        },
+        "prompt_profile": (
+            "qwen" if str(base_model).startswith("qwen") else "default"
+        ),
         "data_protocol": (
             "Use the official GSM8K train split for online training. Evaluate "
             f"on the selected test set: {test_dataset}. No validation split is "

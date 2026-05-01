@@ -45,7 +45,7 @@ CHAT_SYSTEM_PROMPT = os.environ.get(
         "Follow the required final-line format exactly."
     ),
 ).strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAS_MAX_NEW_TOKENS", "128") or "128")
+MAX_NEW_TOKENS = int(os.environ.get("MAS_MAX_NEW_TOKENS", "512") or "512")
 TRAIN_MAX_NEW_TOKENS = int(
     os.environ.get("MAS_TRAIN_MAX_NEW_TOKENS", str(MAX_NEW_TOKENS)) or str(MAX_NEW_TOKENS)
 )
@@ -53,10 +53,10 @@ EVAL_MAX_NEW_TOKENS = int(
     os.environ.get("MAS_EVAL_MAX_NEW_TOKENS", str(MAX_NEW_TOKENS)) or str(MAX_NEW_TOKENS)
 )
 PROPOSAL_COMPLETION_MAX_NEW_TOKENS = int(
-    os.environ.get("MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS", "32") or "32"
+    os.environ.get("MAS_PROPOSAL_COMPLETION_MAX_NEW_TOKENS", "512") or "512"
 )
 REVIEW_COMPLETION_MAX_NEW_TOKENS = int(
-    os.environ.get("MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS", "16") or "16"
+    os.environ.get("MAS_REVIEW_COMPLETION_MAX_NEW_TOKENS", "512") or "512"
 )
 PROPOSAL_REVIEW_OUTPUT_MODE = os.environ.get(
     "MAS_PROPOSAL_REVIEW_OUTPUT_MODE",
@@ -566,6 +566,95 @@ PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_GPQA = (
     "If the latest review says WRONG, fix the decisive mistake and choose again.\n"
     "If the latest review says RIGHT, keep the option unless you find a clear error.\n"
     "Keep one concise chain of thought; do not branch into alternatives.\n"
+    "Choose exactly one option letter from A, B, C, and D.\n"
+    "End with exactly one final line: Final answer: <A/B/C/D>.\n\n"
+    "Solution:\n"
+)
+
+PI0_PROMPT_PROPOSAL_REVIEW_QWEN = (
+    "{context}\n\n"
+    "You are a rigorous verifier for a math collaboration system.\n"
+    "Judge only the current pending final answer for the original problem.\n"
+    "Check the key computation, units, and whether the final value matches the question.\n"
+    "First line: RIGHT or WRONG.\n"
+    "Second line: one concise reason with the decisive check.\n"
+    "Do not write a new solution or a new final answer.\n\n"
+    "Review:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_QWEN = (
+    "{context}\n\n"
+    "Solve the original math problem directly.\n"
+    "Use any pending solution or review feedback as evidence, not as authority.\n"
+    "Work through the decisive reasoning clearly and concisely, verify the arithmetic, "
+    "and avoid changing a correct pending answer without a concrete error.\n"
+    "End with exactly one final line: Final answer: <number>.\n\n"
+    "Solution:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_QWEN = (
+    "{context}\n\n"
+    "Solve the original math problem directly.\n"
+    "Use the pending solution and latest review as hints, then perform your own decisive check.\n"
+    "If the review says WRONG, identify the exact mistake and recompute.\n"
+    "If the review says RIGHT, preserve the answer unless a clear contradiction appears.\n"
+    "Keep the reasoning clear and compact.\n"
+    "End with exactly one final line: Final answer: <number>.\n\n"
+    "Solution:\n"
+)
+PI0_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN = (
+    "{context}\n\n"
+    "You are a rigorous verifier for a math collaboration system.\n"
+    "Judge whether the current pending final answer is mathematically equivalent to the correct answer "
+    "for the original problem.\n"
+    "Check the main theorem, algebraic transformation, boundary condition, and final expression form.\n"
+    "First line: RIGHT or WRONG.\n"
+    "Second line: one concise reason with the decisive check.\n"
+    "Do not write a new solution or a new final answer.\n\n"
+    "Review:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN = (
+    "{context}\n\n"
+    "Solve the original math problem directly.\n"
+    "Use any pending solution or review feedback as evidence, not as authority.\n"
+    "Give one coherent solution path, verify symbolic simplifications and edge conditions, "
+    "and use the exact answer form required by the problem.\n"
+    "End with exactly one final line: Final answer: \\boxed{<answer>}.\n\n"
+    "Solution:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_MATH500_QWEN = (
+    "{context}\n\n"
+    "Solve the original math problem directly.\n"
+    "Use the pending solution and latest review as hints, then perform your own decisive check.\n"
+    "If the review says WRONG, fix the exact mathematical error and recompute.\n"
+    "If the review says RIGHT, preserve the answer unless a clear contradiction appears.\n"
+    "Give one coherent solution path and use the exact answer form required by the problem.\n"
+    "End with exactly one final line: Final answer: \\boxed{<answer>}.\n\n"
+    "Solution:\n"
+)
+PI0_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN = (
+    "{context}\n\n"
+    "You are a rigorous verifier for a science multiple-choice collaboration system.\n"
+    "Judge only whether the current pending option letter is correct for the original question.\n"
+    "Check the decisive scientific fact or reasoning and compare it against all options if needed.\n"
+    "First line: RIGHT or WRONG.\n"
+    "Second line: one concise reason with the decisive check.\n"
+    "Do not write a new solution or a new final answer.\n\n"
+    "Review:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN = (
+    "{context}\n\n"
+    "Solve the original multiple-choice science question directly.\n"
+    "Use any pending solution or review feedback as evidence, not as authority.\n"
+    "Reason through the decisive concept, eliminate incompatible options when useful, "
+    "and choose exactly one option letter from A, B, C, and D.\n"
+    "End with exactly one final line: Final answer: <A/B/C/D>.\n\n"
+    "Solution:\n"
+)
+PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_GPQA_QWEN = (
+    "{context}\n\n"
+    "Solve the original multiple-choice science question directly.\n"
+    "Use the pending solution and latest review as hints, then perform your own decisive check.\n"
+    "If the review says WRONG, correct the specific scientific or elimination error and choose again.\n"
+    "If the review says RIGHT, preserve the option unless a clear contradiction appears.\n"
     "Choose exactly one option letter from A, B, C, and D.\n"
     "End with exactly one final line: Final answer: <A/B/C/D>.\n\n"
     "Solution:\n"

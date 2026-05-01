@@ -428,22 +428,51 @@ def is_exact_match(pred_num, gt):
     """
     return answers_match(pred_num, gt)
 
+def get_active_base_model_key():
+    raw = (
+        os.environ.get("FINAL_BASE_MODEL")
+        or os.environ.get("MAS_MODEL_SCOPE")
+        or GPT2_MODEL_SCOPE
+        or ""
+    )
+    normalized = str(raw).strip().lower().replace("_", "-")
+    if "qwen" in normalized:
+        return "qwen2.5-7b-instruct"
+    if "phi" in normalized:
+        return "phi3-mini-4k-instruct"
+    return normalized
+
+def uses_qwen_prompt_profile():
+    return get_active_base_model_key() == "qwen2.5-7b-instruct"
+
 def get_active_reviewer_prompt():
     answer_format = get_active_answer_format()
     if is_proposal_review_schema():
         if answer_format == ANSWER_FORMAT_MATH500:
+            if uses_qwen_prompt_profile():
+                return PI0_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN
             return PI0_PROMPT_PROPOSAL_REVIEW_MATH500
         if answer_format == ANSWER_FORMAT_GPQA_DIAMOND:
+            if uses_qwen_prompt_profile():
+                return PI0_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN
             return PI0_PROMPT_PROPOSAL_REVIEW_GPQA
+        if uses_qwen_prompt_profile():
+            return PI0_PROMPT_PROPOSAL_REVIEW_QWEN
     return PI0_PROMPT
 
 def get_active_solver_prompt():
     answer_format = get_active_answer_format()
     if is_proposal_review_schema():
         if answer_format == ANSWER_FORMAT_MATH500:
+            if uses_qwen_prompt_profile():
+                return PI1_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN
             return PI1_PROMPT_PROPOSAL_REVIEW_MATH500
         if answer_format == ANSWER_FORMAT_GPQA_DIAMOND:
+            if uses_qwen_prompt_profile():
+                return PI1_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN
             return PI1_PROMPT_PROPOSAL_REVIEW_GPQA
+        if uses_qwen_prompt_profile():
+            return PI1_PROMPT_PROPOSAL_REVIEW_QWEN
     return PI1_PROMPT
 
 def render_history_turn(turn):
@@ -1409,14 +1438,26 @@ def get_proposal_review_proposer_prompt(proposal_mode):
     answer_format = get_active_answer_format()
     if answer_format == ANSWER_FORMAT_MATH500:
         if proposal_mode == "refresh_pending":
+            if uses_qwen_prompt_profile():
+                return PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_MATH500_QWEN
             return PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_MATH500
+        if uses_qwen_prompt_profile():
+            return PI1_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN
         return PI1_PROMPT_PROPOSAL_REVIEW_MATH500
     if answer_format == ANSWER_FORMAT_GPQA_DIAMOND:
         if proposal_mode == "refresh_pending":
+            if uses_qwen_prompt_profile():
+                return PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_GPQA_QWEN
             return PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_GPQA
+        if uses_qwen_prompt_profile():
+            return PI1_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN
         return PI1_PROMPT_PROPOSAL_REVIEW_GPQA
     if proposal_mode == "refresh_pending":
+        if uses_qwen_prompt_profile():
+            return PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_QWEN
         return PI1_PROMPT_PROPOSAL_REVIEW_REFRESH
+    if uses_qwen_prompt_profile():
+        return PI1_PROMPT_PROPOSAL_REVIEW_QWEN
     return PI1_PROMPT_PROPOSAL_REVIEW
 
 
@@ -3320,8 +3361,8 @@ def get_three_layer_action_spec(act):
     if act == MIDDLE_ACTION_SILENT:
         return "pi2", None, "pi2", "silent"
     if act == MIDDLE_ACTION_COMMENT:
-        return "pi0", PI0_PROMPT, "pi0", "comment"
-    return "pi1", PI1_PROMPT, "pi1", "answer"
+        return "pi0", get_active_reviewer_prompt(), "pi0", "comment"
+    return "pi1", get_active_solver_prompt(), "pi1", "answer"
 
 def compute_answer_candidate_rewards(
     batch,
@@ -6026,6 +6067,17 @@ def build_parallel_worker_module_overrides():
         "GSPO_NUM_GREEDY_CANDIDATES": int(GSPO_NUM_GREEDY_CANDIDATES),
         "PI0_PROMPT": PI0_PROMPT,
         "PI1_PROMPT": PI1_PROMPT,
+        "PI0_PROMPT_PROPOSAL_REVIEW_QWEN": PI0_PROMPT_PROPOSAL_REVIEW_QWEN,
+        "PI1_PROMPT_PROPOSAL_REVIEW_QWEN": PI1_PROMPT_PROPOSAL_REVIEW_QWEN,
+        "PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_QWEN": PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_QWEN,
+        "PI0_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN": PI0_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN,
+        "PI1_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN": PI1_PROMPT_PROPOSAL_REVIEW_MATH500_QWEN,
+        "PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_MATH500_QWEN": PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_MATH500_QWEN,
+        "PI0_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN": PI0_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN,
+        "PI1_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN": PI1_PROMPT_PROPOSAL_REVIEW_GPQA_QWEN,
+        "PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_GPQA_QWEN": PI1_PROMPT_PROPOSAL_REVIEW_REFRESH_GPQA_QWEN,
+        "ACTIVE_BASE_MODEL_KEY": get_active_base_model_key(),
+        "ACTIVE_PROMPT_PROFILE": "qwen" if uses_qwen_prompt_profile() else "default",
         "PROPOSAL_REVIEW_CONTROLLER_OVERRIDE_MODE": PROPOSAL_REVIEW_CONTROLLER_OVERRIDE_MODE,
         "PROPOSAL_REVIEW_DISABLE_CONTROLLER_REGRET": bool(PROPOSAL_REVIEW_DISABLE_CONTROLLER_REGRET),
         "PROPOSAL_REVIEW_DISABLE_COUNTERFACTUAL_VALUES": bool(PROPOSAL_REVIEW_DISABLE_COUNTERFACTUAL_VALUES),
